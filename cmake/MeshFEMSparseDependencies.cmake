@@ -40,7 +40,6 @@ if (MESHFEM_WITH_CATAMARI AND NOT TARGET catamari)
         add_subdirectory(${MESHFEM_EXTERNAL}/catamari_legacy ${CMAKE_BINARY_DIR}/3rdparty/catamari_legacy)
     else()
         meshfem_download_catamari()
-        add_subdirectory(${MESHFEM_EXTERNAL}/catamari ${CMAKE_BINARY_DIR}/3rdparty/catamari)
     endif()
 endif()
 

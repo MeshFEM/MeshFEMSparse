@@ -14,9 +14,12 @@ endfunction()
 ## Catamari
 # TODO: change this to https once public.
 function(meshfem_download_catamari)
-    meshfem_download_project(catamari
+    FetchContent_Declare(catamari
         GIT_REPOSITORY git@github.com:MeshFEM/catamari_dev.git
-        GIT_TAG        c5fb38a14c3dc7443c660aea655725544d987c9e)
+        GIT_TAG        c5fb38a14c3dc7443c660aea655725544d987c9e
+        SOURCE_DIR     ${MESHFEM_EXTERNAL}/catamari
+    )
+    FetchContent_MakeAvailable(catamari)
 endfunction()
 
 ## catamari_legacy
