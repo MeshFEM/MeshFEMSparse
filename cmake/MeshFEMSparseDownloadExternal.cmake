@@ -12,11 +12,11 @@ function(meshfem_download_catch)
 endfunction()
 
 ## Catamari
-# TODO: change this to https once public.
+# TODO: change these to pinned tags and https once public.
 function(meshfem_download_catamari)
     FetchContent_Declare(catamari
         GIT_REPOSITORY git@github.com:MeshFEM/catamari_dev.git
-        GIT_TAG        c5fb38a14c3dc7443c660aea655725544d987c9e
+        GIT_TAG        master
         SOURCE_DIR     ${MESHFEM_EXTERNAL}/catamari
     )
     FetchContent_MakeAvailable(catamari)

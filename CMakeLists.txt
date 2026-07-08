@@ -22,10 +22,10 @@ option(MESHFEMSPARSE_BUILD_TESTS "Build MeshFEMSparse tests" ${MESHFEMSPARSE_TOP
 
 if(NOT TARGET MeshFEMCore)
     include(FetchContent)
-    # TODO: change these to https once public.
+    # TODO: change these to pinned tags and https once public.
     set(MESHFEMCORE_GIT_REPOSITORY "git@github.com:MeshFEM/MeshFEMCore.git"
         CACHE STRING "MeshFEMCore git repository")
-    set(MESHFEMCORE_GIT_TAG "2867a326f79269660da80846d273e4440817cbe8"
+    set(MESHFEMCORE_GIT_TAG "main"
         CACHE STRING "MeshFEMCore git revision")
     set(MESHFEM_EXTERNAL "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty"
         CACHE PATH "External dependency source directory")
