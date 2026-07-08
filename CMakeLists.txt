@@ -9,6 +9,7 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 list(REMOVE_DUPLICATES CMAKE_MODULE_PATH)
+include(MeshFEMFetchEditableRepo)
 
 option(MESHFEM_WITH_CATAMARI         "Compile MeshFEM with Catamari"   ON)
 option(MESHFEM_USE_LEGACY_CATAMARI   "Use Jack Poulson's original Catamari code for comparisons instead of our accelerated BlockCatamari"  OFF)
@@ -30,6 +31,8 @@ if(NOT TARGET MeshFEMCore)
     set(MESHFEM_EXTERNAL "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty"
         CACHE PATH "External dependency source directory")
 
+    meshfem_prepare_editable_repo(MeshFEMCore
+        "${MESHFEM_EXTERNAL}/MeshFEMCore" "${MESHFEMCORE_GIT_TAG}")
     FetchContent_Declare(MeshFEMCore
         GIT_REPOSITORY ${MESHFEMCORE_GIT_REPOSITORY}
         GIT_TAG        ${MESHFEMCORE_GIT_TAG}

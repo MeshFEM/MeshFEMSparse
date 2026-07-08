@@ -14,6 +14,8 @@ endfunction()
 ## Catamari
 # TODO: change these to pinned tags and https once public.
 function(meshfem_download_catamari)
+    meshfem_prepare_editable_repo(catamari
+        "${MESHFEM_EXTERNAL}/catamari" master)
     FetchContent_Declare(catamari
         GIT_REPOSITORY git@github.com:MeshFEM/catamari_dev.git
         GIT_TAG        master
