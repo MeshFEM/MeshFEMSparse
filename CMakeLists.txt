@@ -10,10 +10,19 @@ endif()
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 list(REMOVE_DUPLICATES CMAKE_MODULE_PATH)
 
+option(MESHFEM_WITH_CATAMARI         "Compile MeshFEM with Catamari"   ON)
+option(MESHFEM_USE_LEGACY_CATAMARI   "Use Jack Poulson's original Catamari code for comparisons instead of our accelerated BlockCatamari"  OFF)
+option(MESHFEM_WITH_SCOTCH           "Compile MeshFEM with support for Scotch reordering, if possible" OFF)
+option(MESHFEM_WITH_MKL_PARDISO      "Compile MeshFEM with MKL Pardiso"   OFF)
+option(MESHFEM_WITH_PARDISO          "Compile MeshFEM with Pardiso"   OFF)
+option(MESHFEM_WITH_CHOLMOD          "Compile MeshFEM with CHOLMOD for LL^T factorization" ON)
+option(MESHFEM_WITH_UMFPACK          "Compile MeshFEM with UMFPACK for LU factorization (GPL licensed)" OFF)
+
 option(MESHFEMSPARSE_BUILD_TESTS "Build MeshFEMSparse tests" ${MESHFEMSPARSE_TOPLEVEL_PROJECT})
 
 if(NOT TARGET MeshFEMCore)
     include(FetchContent)
+    # TODO: change these to https once public.
     set(MESHFEMCORE_GIT_REPOSITORY "git@github.com:MeshFEM/MeshFEMCore.git"
         CACHE STRING "MeshFEMCore git repository")
     set(MESHFEMCORE_GIT_TAG "2867a326f79269660da80846d273e4440817cbe8"

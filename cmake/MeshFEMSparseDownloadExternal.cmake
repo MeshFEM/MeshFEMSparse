@@ -11,13 +11,13 @@ function(meshfem_download_catch)
     )
 endfunction()
 
-# ## Catamari
-# DISABLED until BlockCatamari is released.
-# function(meshfem_download_catamari)
-#     meshfem_download_project(catamari
-#         GIT_REPOSITORY https://github.com/MeshFEM/catamari.git
-#         GIT_TAG        23b858e18f639261bae4a2fe15d00a286cda963d)
-# endfunction()
+## Catamari
+# TODO: change this to https once public.
+function(meshfem_download_catamari)
+    meshfem_download_project(catamari
+        GIT_REPOSITORY git@github.com:MeshFEM/catamari_dev.git
+        GIT_TAG        c5fb38a14c3dc7443c660aea655725544d987c9e)
+endfunction()
 
 ## catamari_legacy
 function(meshfem_download_catamari_legacy)
