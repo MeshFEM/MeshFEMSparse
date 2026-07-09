@@ -1,13 +1,15 @@
 #include "AccelerateFactorizer.hh"
 #include "CholmodFactorizer.hh"
 
+#if !MESHFEM_WITH_CHOLMOD
+struct cholmod_common { };
+#endif
+
 namespace MeshFEM {
 
 #if __APPLE__ && MESHFEM_WITH_CHOLMOD
 
 AccelerateFactorizer::AccelerateFactorizer() {
-    ensureApple();
-#ifdef __APPLE__
     m_opts.control = SparseDefaultControl;
     m_opts.orderMethod = SparseOrderMetis;
     m_opts.order                = nullptr;
@@ -18,17 +20,11 @@ AccelerateFactorizer::AccelerateFactorizer() {
     // system malloc/free) does not work (EXC_BAD_ACCESS during symbolic factorization).
     m_opts.malloc = malloc;
     m_opts.free   = free;
-#endif
 }
 
-void AccelerateFactorizer::ensureApple() const {
-#ifndef __APPLE__
-    throw std::runtime_error("Accelerate is only available on Apple platforms.");
-#endif
-}
+void AccelerateFactorizer::ensureApple() const { }
 
 void AccelerateFactorizer::m_setUpperTriangleCSC(const SuiteSparseMatrix &A_reduced) {
-#ifdef __APPLE__
     const auto &Lsp = A_reduced;
 
 
@@ -56,7 +52,6 @@ void AccelerateFactorizer::m_setUpperTriangleCSC(const SuiteSparseMatrix &A_redu
     s.attributes.kind               = SparseSymmetric;
     s.attributes._reserved          = 0;
     s.attributes._allocatedBySparse = false;
-#endif
 }
 
 void AccelerateFactorizer::factorizeSymbolic(const BlockCSCHessianBase &mat, const std::vector<size_t> &pinnedVars) {
@@ -83,9 +78,7 @@ void AccelerateFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const
 void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &mat,
                                                        const std::vector<size_t> &pinnedVars) {
     BENCHMARK_SCOPED_TIMER_SECTION timer("AccelerateFactorizer.m_symbolicFactorizationImpl<" + std::to_string(m_blockSize) + ">");
-    ensureApple();
 
-#ifdef __APPLE__
     const SuiteSparseMatrix *A_reduced;
 
     if (m_blockSize > 1 && pinnedVars.size() > 0) {
@@ -238,11 +231,9 @@ void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &
     m_symfactor.reset();
     m_symfactor = std::make_unique<SFWrap>(SparseFactorizationCholesky, m_sparseA.structure, m_opts); // throws on failure!
     m_factorizationType = FactorizationType::Symbolic;
-#endif
 }
 
 void AccelerateFactorizer::m_numericFactorizationImpl(const Real *Ax) {
-#ifdef __APPLE__
     assertFactorization(FactorizationType::Symbolic);
 
     BENCHMARK_SCOPED_TIMER_SECTION timer("Accelerate SparseFactor Numeric Call");
@@ -251,7 +242,6 @@ void AccelerateFactorizer::m_numericFactorizationImpl(const Real *Ax) {
     m_numfactor.reset();
     m_numfactor = std::make_unique<NFWrap>(m_symfactor->factor, m_sparseA); // throws on failure!
     m_factorizationType = FactorizationType::Numeric;
-#endif
 }
 
 void AccelerateFactorizer::setValuesFromSource(const SuiteSparseMatrix &A, Real sigma) {
@@ -291,7 +281,6 @@ void AccelerateFactorizer::setValuesFromSource(const SuiteSparseMatrix &A, Real 
 void AccelerateFactorizer::factorizeNumeric(const SuiteSparseMatrix &A, bool) {
     // std::cout << "factorizeNumeric" << std::endl;
     BENCHMARK_SCOPED_TIMER_SECTION timer("AccelerateFactorizer.factorizeNumeric<" + std::to_string(m_blockSize) + ">");
-    ensureApple();
 
     if (m_blockEntryForReducedBlockEntry.size() > 0 && m_blockSize == 1)
         throw std::runtime_error("Inconsistent state: block entry map exists but block size is 1");
@@ -308,7 +297,6 @@ void AccelerateFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &A,
                                                      bool) {
     BENCHMARK_SCOPED_TIMER_SECTION timer("AccelerateFactorizer.factorizeNumeric<" + std::to_string(m_blockSize) + ">");
     // std::cout << "factorizeNumericWithShift sigma B" << std::endl;
-    ensureApple();
     if ((B.m != A.m) || (B.n != A.n)) throw std::runtime_error("Unexpected input shape(s)");
     if (B.Ai.size() != A.Ai.size()) throw std::runtime_error("B must have the same sparsity pattern as A");
 
@@ -325,7 +313,6 @@ void AccelerateFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &A,
                                                      bool) {
     BENCHMARK_SCOPED_TIMER_SECTION timer("AccelerateFactorizer.factorizeNumeric<" + std::to_string(m_blockSize) + ">");
     // std::cout << "factorizeNumericWithShift sigma I, sigma = " << sigma << std::endl;
-    ensureApple();
     setValuesFromSource(A, sigma);
     m_numericFactorizationImpl(m_A_csc.Ax.data());
 }
@@ -334,14 +321,11 @@ void AccelerateFactorizer::solveRawReduced(const Real *b,
                                            Real *x,
                                            CholeskySys sys,
                                            bool) const {
-    ensureApple();
     assertFactorization(sys);
-#ifdef __APPLE__
     DenseVector_Double rhs{ m_reducedSizeScalar, const_cast<Real *>(b) }; // Accelerate doesn't have a const DenseVector...
     DenseVector_Double sol{ m_reducedSizeScalar, x };
 
     SparseSolve(m_numfactor->factor, rhs, sol);
-#endif
 }
 
 AccelerateFactorizer::~AccelerateFactorizer() {
@@ -349,13 +333,7 @@ AccelerateFactorizer::~AccelerateFactorizer() {
     if (m_c_int) cholmod_finish(m_c_int.get());
 }
 
-#else
-
-} // namespace MeshFEM
-
-struct cholmod_common { };
-
-namespace MeshFEM {
+#else // __APPLE__ && MESHFEM_WITH_CHOLMOD
 
 namespace {
 [[noreturn]] void throw_accelerate_unavailable() {
@@ -367,7 +345,7 @@ namespace {
 }
 }
 
-AccelerateFactorizer::AccelerateFactorizer() { }
+AccelerateFactorizer::AccelerateFactorizer() { throw_accelerate_unavailable(); }
 AccelerateFactorizer::~AccelerateFactorizer() = default;
 
 void AccelerateFactorizer::ensureApple() const { throw_accelerate_unavailable(); }
