@@ -644,12 +644,7 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
     // Gather-based assembly: a more scalable alternative for high threadcount
     // settings.
     //
-    // WARNING: this is only supported in cases where only a single, fixed
-    // element set is used across the lifetime of the assembler object.
-    // Supporting different/changing element sets would require maintaining
-    // multiple GatherCache objects.
-    //
-    // Currently the implemenation also only supports the SingleBlockDim case
+    // Currently the implementation also only supports the SingleBlockDim case
     // with compile-time-known per-element gradient sizes. These
     // are not fundamental limitations and could be lifted with additional
     // bookkeeping in the GatherCache.
@@ -675,10 +670,8 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
         NodeLocalNodeAdjacencyMatrix localBVarsForGlobalBVar; // TODO: we could use a more compact special-purpose datastructure here
     };
 
-    mutable std::unique_ptr<GatherCache> m_gatherCache;
-
     template<bool Accumulate = true, class Result, class PEGEval, class ElementGetter>
-    void assembleGradientGather(Result &g, size_t ne, const PEGEval &eval_ge, const ElementGetter &element) const {
+    void assembleGradientGather(Result &g, size_t ne, const PEGEval &eval_ge, const ElementGetter &element, std::unique_ptr<GatherCache> &gatherCache) const {
         using PEG = decltype(eval_ge(0));
         static_assert(PEG::SizeAtCompileTime > 0, "Per-element gradient currently must be of compile-time-known size for scatter-gather assembly");
         static_assert(VarStructure::SingleBlockDim, "Only SingleBlockDim case is implemented");
@@ -687,14 +680,15 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
         constexpr size_t N = VarStructure::FirstBlockDim;
         static constexpr int numBlockVarsPerElement = numElemLocalVars / N;
 
-        // Cache vertex => (element, local index) map in a CSCMatrix<Char>
-        if (!m_gatherCache)
-            m_gatherCache = std::make_unique<GatherCache>(ne, N, numBlockVarsPerElement, element);
+        if (!gatherCache) {
+            // Cache vertex => (element, local index) map in a CSCMatrix<Char>
+            gatherCache = std::make_unique<GatherCache>(ne, N, numBlockVarsPerElement, element);
+        }
 
-        auto &pregatherGradient = m_gatherCache->pregatherGradient;
+        auto &pregatherGradient = gatherCache->pregatherGradient;
         pregatherGradient.resize(ne * numElemLocalVars);
 
-        const auto &localBVarsForGlobalBVar = m_gatherCache->localBVarsForGlobalBVar;
+        const auto &localBVarsForGlobalBVar = gatherCache->localBVarsForGlobalBVar;
         size_t num_bvars = localBVarsForGlobalBVar.n;
 
         parallel_for_range(ne, [&pregatherGradient, &eval_ge](size_t ei) {
@@ -707,17 +701,18 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
         parallel_for_range(num_bvars, [&g, Ai, Ap, &pregatherGradient](size_t ni) {
                 auto *idxPtr = Ai + Ap[ni];
                 auto *colEnd = Ai + Ap[ni + 1];
+                // For certain stencil types (e.g., hinge stencils) it is
+                // possible that a global variable has no incident elements...
+                if (idxPtr == colEnd) {
+                    if constexpr (!Accumulate) g.template segment<N>(N * ni).setZero();
+                    return;
+                }
                 VecN_T<Real, N> g_n = pregatherGradient.template segment<N>(*idxPtr);
                 for (++idxPtr; idxPtr < colEnd; ++idxPtr)
                     g_n += pregatherGradient.template segment<N>(*idxPtr);
                 if constexpr (Accumulate) g.template segment<N>(N * ni) += g_n;
                 else                      g.template segment<N>(N * ni)  = g_n;
             }, 100, 1000);
-    }
-
-    template<bool Accumulate = true, class Result, class Mesh, class PEGEval>
-    void assembleGradientGather(Result &g, const Mesh &m, const PEGEval &eval_ge) const {
-        return assembleGradientGather<Accumulate>(g, m.numElements(), eval_ge, [&m](size_t ei) { return m.elementNodeIndices(ei); });
     }
 
     // Due to the limitations of `assembleGradientGather`, we provide
@@ -728,12 +723,12 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
     // that the same element set is reused across the lifetime of the
     // assembler object.
     template<bool Accumulate = true, class Result, class PEGEval, class ElementGetter>
-    void assembleGradientConditionalGather(Result &g, size_t ne, const PEGEval &eval_ge, const ElementGetter &element) const {
+    void assembleGradientConditionalGather(Result &g, size_t ne, const PEGEval &eval_ge, const ElementGetter &element, std::unique_ptr<GatherCache> &gatherCache) const {
         using PEG = decltype(eval_ge(0));
         if constexpr (PEG::SizeAtCompileTime > 0 && VarStructure::SingleBlockDim) {
             // Gather-based assembly is only beneficial in higher thread-count settings
             if (get_max_num_tbb_threads() >= 4) {
-                assembleGradientGather<Accumulate>(g, ne, eval_ge, element);
+                assembleGradientGather<Accumulate>(g, ne, eval_ge, element, gatherCache);
                 return;
             }
         }
@@ -742,8 +737,8 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
     }
 
     template<bool Accumulate = true, class Result, class Mesh, class PEGEval>
-    void assembleGradientConditionalGather(Result &g, const Mesh &m, const PEGEval &eval_ge) const {
-        return assembleGradientConditionalGather<Accumulate>(g, m.numElements(), eval_ge, [&m](size_t ei) { return m.elementNodeIndices(ei); });
+    void assembleGradientConditionalGather(Result &g, const Mesh &m, const PEGEval &eval_ge, std::unique_ptr<GatherCache> &gatherCache) const {
+        return assembleGradientConditionalGather<Accumulate>(g, m.numElements(), eval_ge, [&m](size_t ei) { return m.elementNodeIndices(ei); }, gatherCache);
     }
 
     struct ElementColoring {
@@ -786,10 +781,8 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
         std::vector<Eigen::VectorXi> elementsForColor;
     };
 
-    mutable std::unique_ptr<ElementColoring> elementColoring;
-
     template<class Result, class PEGEval, class ElementGetter>
-    void assembleGradientColoring(Result &g, size_t ne, const PEGEval &eval_ge, const ElementGetter &element) const {
+    void assembleGradientColoring(Result &g, size_t ne, const PEGEval &eval_ge, const ElementGetter &element, std::unique_ptr<ElementColoring> &elementColoring) const {
         // TODO: run serially for small stencil sets...
         if (!elementColoring)
             elementColoring = std::make_unique<ElementColoring>(numBlockVars(), ne, element);
