@@ -21,8 +21,8 @@
 namespace MeshFEM {
 
 enum class PardisoSparseOrder : uint8_t {
-    AMD           = 2,
-    Metis         = 3,
+    AMD           = 1,
+    Metis         = 2,
     ParallelMetis = 3,
 };
 
