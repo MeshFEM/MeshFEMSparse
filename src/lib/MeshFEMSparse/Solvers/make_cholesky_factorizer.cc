@@ -1,9 +1,6 @@
 #include "make_cholesky_factorizer.hh"
 
 #include "CholmodFactorizer.hh"
-#if MESHFEM_WITH_UMFPACK
-#include "UmfpackFactorizer.hh"
-#endif
 #include "CatamariFactorizer.hh"
 #if MESHFEM_WITH_PARDISO || MESHFEM_WITH_MKL_PARDISO
 #include "PardisoFactorizer.hh"

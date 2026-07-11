@@ -16,10 +16,20 @@ option(MESHFEM_USE_LEGACY_CATAMARI   "Use Jack Poulson's original Catamari code 
 option(MESHFEM_WITH_SCOTCH           "Compile MeshFEM with support for Scotch reordering, if possible" OFF)
 option(MESHFEM_WITH_MKL_PARDISO      "Compile MeshFEM with MKL Pardiso"   OFF)
 option(MESHFEM_WITH_PARDISO          "Compile MeshFEM with Pardiso"   OFF)
+option(MESHFEM_NO_GPL                "Compile MeshFEM without GPL-licensed dependencies (UMFPACK, supernodal CHOLMOD, etc.)" OFF)
 option(MESHFEM_WITH_CHOLMOD          "Compile MeshFEM with CHOLMOD for LL^T factorization" ON)
 option(MESHFEM_WITH_UMFPACK          "Compile MeshFEM with UMFPACK for LU factorization (GPL licensed)" OFF)
 
 option(MESHFEMSPARSE_BUILD_TESTS "Build MeshFEMSparse tests" ${MESHFEMSPARSE_TOPLEVEL_PROJECT})
+
+if (MESHFEM_NO_GPL)
+    message(STATUS "MESHFEM_NO_GPL is enabled; UMFPACK and supernodal CHOLMOD will be disabled.")
+    message(STATUS "Warning: for a fully compliant binary, make sure that CHOLMOD is built without supernodal support (i.e., with SuiteSparse configured with `-DCHOLMOD_GPL=OFF`).")
+endif()
+
+if (MESHFEM_NO_GPL AND MESHFEM_WITH_UMFPACK)
+    message(FATAL_ERROR "MESHFEM_NO_GPL and MESHFEM_WITH_UMFPACK are mutually exclusive.")
+endif()
 
 if(NOT TARGET MeshFEMCore)
     include(FetchContent)
@@ -85,36 +95,40 @@ target_link_libraries(MeshFEMSparse
 
 target_compile_options(MeshFEMSparse PUBLIC -fvisibility=hidden)
 
+if(MESHFEM_NO_GPL)
+    target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_NO_GPL)
+endif()
+
 if(MESHFEM_WITH_UMFPACK)
-    target_compile_definitions(MeshFEMSparse PUBLIC -DMESHFEM_WITH_UMFPACK)
+    target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_UMFPACK)
     target_link_libraries(MeshFEMSparse PUBLIC umfpack::umfpack)
 endif()
 
 if(MESHFEM_WITH_CHOLMOD)
-    target_compile_definitions(MeshFEMSparse PUBLIC -DMESHFEM_WITH_CHOLMOD)
+    target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_CHOLMOD)
     target_link_libraries(MeshFEMSparse PUBLIC cholmod::cholmod)
 endif()
 
 if (MESHFEM_WITH_CATAMARI)
-    target_compile_definitions(MeshFEMSparse PUBLIC -DMESHFEM_WITH_CATAMARI)
+    target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_CATAMARI)
     target_link_libraries(MeshFEMSparse PUBLIC catamari)
     if (MESHFEM_USE_LEGACY_CATAMARI)
-        target_compile_definitions(MeshFEMSparse PUBLIC -DMESHFEM_USE_LEGACY_CATAMARI)
+        target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_USE_LEGACY_CATAMARI)
     endif()
 endif()
 
 if (MESHFEM_WITH_SCOTCH)
-    target_compile_definitions(MeshFEMSparse PUBLIC -DMESHFEM_WITH_SCOTCH)
+    target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_SCOTCH)
     target_link_libraries(MeshFEMSparse PUBLIC SCOTCH::scotch SCOTCH::scotcherrexit)
 endif()
 
 if (MESHFEM_WITH_MKL_PARDISO)
-    target_compile_definitions(MeshFEMSparse PUBLIC -DMESHFEM_WITH_MKL_PARDISO)
+    target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_MKL_PARDISO)
 endif()
 
 if (MESHFEM_WITH_PARDISO)
     set(MKLROOT /opt/intel/mkl)
-    target_compile_definitions(MeshFEMSparse PUBLIC -DMESHFEM_WITH_PARDISO)
+    target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_PARDISO)
     target_link_libraries(MeshFEMSparse PUBLIC
         /home/jpanetta/software/pardiso/libpardiso600-GNU800-X86-64.so
          -L${MKLROOT}/lib/intel64 -lmkl_rt -Wl,--no-as-needed -lpthread -lm -ldl -lgomp

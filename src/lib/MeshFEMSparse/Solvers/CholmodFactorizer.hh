@@ -144,6 +144,10 @@ struct CholmodFactorizer final : public CholeskyFactorizerBase {
 #endif
 
         if (forceSupernodal) m_c->supernodal = CHOLMOD_SUPERNODAL;
+#if MESHFEM_NO_GPL
+        if (m_c->supernodal)
+            throw std::runtime_error("CholmodFactorizer: supernodal factorization is not available because MeshFEM was compiled with MESHFEM_NO_GPL=ON");
+#endif
         m_c->final_ll = force_ll;
 
         m_c->print = suppressWarnings ? 0 : 2;
