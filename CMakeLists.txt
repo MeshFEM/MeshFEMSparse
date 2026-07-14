@@ -54,6 +54,9 @@ endif()
 
 include(MeshFEMSparseDependencies)
 
+# Color output
+include(UseColors)
+
 add_library(MeshFEMSparse STATIC
     src/lib/MeshFEMSparse/BlockCSCHessian.cc
     src/lib/MeshFEMSparse/BorderedSparseHessian.cc

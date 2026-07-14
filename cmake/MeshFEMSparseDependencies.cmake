@@ -20,6 +20,28 @@ list(REMOVE_DUPLICATES CMAKE_MODULE_PATH)
 include(MeshFEMCoreDependencies)
 include(MeshFEMSparseDownloadExternal)
 
+function(meshfem_sparse_alias_existing_target alias_name)
+    set(options)
+    set(one_value_args)
+    set(multi_value_args CANDIDATES DEPENDENCIES)
+    cmake_parse_arguments(MESHFEM_ALIAS "${options}" "${one_value_args}" "${multi_value_args}" ${ARGN})
+
+    foreach(candidate IN LISTS MESHFEM_ALIAS_CANDIDATES)
+        if(TARGET ${candidate})
+            if(NOT TARGET ${alias_name})
+                add_library(${alias_name} INTERFACE IMPORTED)
+                target_link_libraries(${alias_name} INTERFACE ${candidate})
+                foreach(dependency IN LISTS MESHFEM_ALIAS_DEPENDENCIES)
+                    if(TARGET ${dependency})
+                        target_link_libraries(${alias_name} INTERFACE ${dependency})
+                    endif()
+                endforeach()
+            endif()
+            return()
+        endif()
+    endforeach()
+endfunction()
+
 if(NOT TARGET Catch2::Catch2 AND MESHFEMSPARSE_BUILD_TESTS)
     meshfem_download_catch()
     add_subdirectory(${MESHFEM_EXTERNAL}/Catch2 ${CMAKE_BINARY_DIR}/3rdparty/Catch2)
@@ -27,11 +49,30 @@ if(NOT TARGET Catch2::Catch2 AND MESHFEMSPARSE_BUILD_TESTS)
 endif()
 
 if (MESHFEM_WITH_CHOLMOD)
-    find_package(CHOLMOD REQUIRED) # provides cholmod::cholmod
+    meshfem_sparse_alias_existing_target(cholmod::cholmod
+        CANDIDATES SuiteSparse::CHOLMOD cholmod
+        DEPENDENCIES
+            SuiteSparse::AMD
+            SuiteSparse::CAMD
+            SuiteSparse::CCOLAMD
+            SuiteSparse::COLAMD
+            SuiteSparse::Config
+    )
+    if(NOT TARGET cholmod::cholmod)
+        find_package(CHOLMOD REQUIRED) # provides cholmod::cholmod
+    endif()
 endif()
 
 if (MESHFEM_WITH_UMFPACK)
-    find_package(UMFPACK REQUIRED) # provides umfpack::umfpack
+    meshfem_sparse_alias_existing_target(umfpack::umfpack
+        CANDIDATES SuiteSparse::UMFPACK umfpack
+        DEPENDENCIES
+            SuiteSparse::AMD
+            SuiteSparse::Config
+    )
+    if(NOT TARGET umfpack::umfpack)
+        find_package(UMFPACK REQUIRED) # provides umfpack::umfpack
+    endif()
 endif()
 
 if (MESHFEM_WITH_CATAMARI AND NOT TARGET catamari)
