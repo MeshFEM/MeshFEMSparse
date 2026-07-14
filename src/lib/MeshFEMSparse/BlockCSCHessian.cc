@@ -107,4 +107,10 @@ std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianBase::fromScalar(const Suite
     return result;
 }
 
+std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianBase::fromScalar(SuiteSparseMatrix &&A) {
+    auto result = BlockCSCHessian<OptimizationVarStructure<1>, false>::construct(OptimizationVarStructure<1>(size_t(A.m)));
+    result->SuiteSparseMatrix::operator=(std::move(A));
+    return result;
+}
+
 } // namespace MeshFEM

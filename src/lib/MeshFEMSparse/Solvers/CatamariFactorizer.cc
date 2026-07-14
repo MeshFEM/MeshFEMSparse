@@ -561,19 +561,19 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
 }
 
 void CatamariFactorizer::factorizeNumeric(const SuiteSparseMatrix &A, bool /* isInTryCatch */) {
-    m_numericFactorizationImpl(A);
+    m_numericFactorizationImpl(A.Ax.data());
 }
 
 void CatamariFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &A, Real sigma, const SuiteSparseMatrix &B, bool /* isInTryCatch */) {
-    m_numericFactorizationImpl(A, sigma, B.Ax.data());
+    m_numericFactorizationImpl(A.Ax.data(), sigma, B.Ax.data());
 }
 
 void CatamariFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &A, Real sigma, bool /* isInTryCatch */) {
-    m_numericFactorizationImpl(A, sigma, nullptr);
+    m_numericFactorizationImpl(A.Ax.data(), sigma, nullptr);
 }
 
 template<typename... Args>
-void CatamariFactorizer::m_numericFactorizationImpl(const SuiteSparseMatrix &A, Args&&... args) {
+void CatamariFactorizer::m_numericFactorizationImpl(const double *Ax, Args&&... args) {
     BENCHMARK_SCOPED_TIMER_SECTION timer("Catamari Numeric Factorize");
     assertFactorization(FactorizationType::Symbolic);
 
@@ -581,7 +581,7 @@ void CatamariFactorizer::m_numericFactorizationImpl(const SuiteSparseMatrix &A, 
 
     catamari::SparseLDLResult<double> result;
     if (m_legacy) throw std::runtime_error("Partial legacy mode disabled; build with MESHFEM_USE_LEGACY_CATAMARI instead.");
-    else          result = m_ldl->RefactorWithFixedSparsityPattern(m_catamariConverter->conversionPlan, (m_useBlockAccel && !disableBlockNFac) ? m_blockSize : 1, A.Ax.data(), std::forward<Args>(args)...);
+    else          result = m_ldl->RefactorWithFixedSparsityPattern(m_catamariConverter->conversionPlan, (m_useBlockAccel && !disableBlockNFac) ? m_blockSize : 1, Ax, std::forward<Args>(args)...);
 
     double num_fact_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - num_fact_start).count();
 

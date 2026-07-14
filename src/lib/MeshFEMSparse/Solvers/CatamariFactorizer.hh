@@ -178,7 +178,7 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
 
 private:
     template<typename... Args>
-    void m_numericFactorizationImpl(const SuiteSparseMatrix &A, Args&&... args);
+    void m_numericFactorizationImpl(const double *Ax, Args&&... args);
 
     void m_factorizeSymbolic(const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars);
 

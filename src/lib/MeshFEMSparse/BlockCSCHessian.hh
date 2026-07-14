@@ -30,7 +30,11 @@
 #include <MeshFEMSparse/SparseMatrices.hh>
 #include <MeshFEMSparse/VarStructure.hh>
 #include <MeshFEMSparse/ParallelAssembly.hh>
+
+#include <Eigen/Sparse>
+
 #include <istream>
+#include <memory>
 #include <type_traits>
 
 namespace MeshFEM {
@@ -566,6 +570,11 @@ struct MESHFEM_EXPORT BlockCSCHessianBase : public SuiteSparseMatrix {
     size_t   blockSizeGCD() const { auto bs = blockSizes(); return std::accumulate(bs.begin(), bs.end(), 0, std::gcd<size_t, size_t>); }
     bool uniformBlockSize() const { return minBlockSize() == maxBlockSize(); }
 
+    void mergeSparsityPattern(const BlockCSCHessianBase *other) {
+        if (!other) return;
+        mergeSparsityPattern(*other);
+    }
+
     void mergeSparsityPattern(const BlockCSCHessianBase &other) {
         if (this->blockVarSizesAndCounts() != other.blockVarSizesAndCounts())
             throw std::runtime_error("BlockCSCHessian::mergeSparsityPattern: incompatible block variable structure");
@@ -605,6 +614,59 @@ struct MESHFEM_EXPORT BlockCSCHessianBase : public SuiteSparseMatrix {
 
     virtual SuiteSparseMatrix toScalar(bool sparsityOnly = false) const = 0;
     static std::unique_ptr<BlockCSCHessianBase> fromScalar(const SuiteSparseMatrix &m);
+    static std::unique_ptr<BlockCSCHessianBase> fromScalar(SuiteSparseMatrix &&m);
+
+    template<typename index_type = int>
+    Eigen::SparseMatrix<double, Eigen::ColMajor, index_type>
+    toEigen(bool upperTriangleOnly = true, const std::vector<size_t> &fixedVars = {}) const {
+        auto H_scalar = toScalar();
+
+        if (!fixedVars.empty()) {
+            std::vector<bool> isFixed(n, false);
+            for (size_t v : fixedVars) isFixed[v] = true;
+            H_scalar.rowColRemoval([&isFixed](size_t v) { return isFixed[v]; });
+        }
+
+        if (!upperTriangleOnly) H_scalar = H_scalar.toSymmetryMode(SuiteSparseMatrix::SymmetryMode::NONE);
+
+        using src_index_type = typename decltype(H_scalar)::index_type;
+        using map = Eigen::Map<const Eigen::SparseMatrix<double, 0, index_type>>;
+        if constexpr (std::is_same_v<index_type, src_index_type>) {
+            return map(H_scalar.m, H_scalar.n, H_scalar.nz, H_scalar.Ap.data(), H_scalar.Ai.data(), H_scalar.Ax.data());
+        }
+        else {
+            VecX_T<index_type> Ai_cast = H_scalar.Ai.template cast<index_type>();
+            VecX_T<index_type> Ap_cast = Eigen::Map<VecX_T<src_index_type>>(H_scalar.Ap.data(), H_scalar.Ap.size()).template cast<index_type>();
+            return map(H_scalar.m, H_scalar.n, H_scalar.nz, Ap_cast.data(), Ai_cast.data(), H_scalar.Ax.data());
+        }
+    }
+
+    // Convert from an Eigen representation.
+    // If `isUpperTriangleOnly` is `false`, an extra conversion step is run to
+    // drop the lower triangle as needed for our `BlockCSCHessian` type.
+    template<int Options_, typename StorageIndex_>
+    static std::unique_ptr<BlockCSCHessianBase> fromEigen(const Eigen::SparseMatrix<double, Options_, StorageIndex_> &A_eigen, bool isUpperTriangleOnly = false) {
+        SuiteSparseMatrix A;
+        A.m = A_eigen.rows();
+        A.n = A_eigen.cols();
+        A.nz = A_eigen.nonZeros();
+        using dst_index_type = typename decltype(A)::index_type;
+
+        auto Ap_map = Eigen::Map<const Eigen::Matrix<StorageIndex_, Eigen::Dynamic, 1>>(A_eigen.outerIndexPtr(), A.m + 1);
+        auto Ai_map = Eigen::Map<const Eigen::Matrix<StorageIndex_, Eigen::Dynamic, 1>>(A_eigen.innerIndexPtr(), A.nz);
+        A.Ap.resize(A.m + 1);
+        Eigen::Map<VecX_T<SuiteSparse_long>>(A.Ap.data(), A.Ap.size()) = Ap_map.template cast<dst_index_type>();
+        A.Ai = Ai_map.template cast<dst_index_type>();
+        A.Ax.assign(A_eigen.valuePtr(), A_eigen.valuePtr() + A.nz);
+        A.symmetry_mode = SuiteSparseMatrix::SymmetryMode::NONE;
+
+        // Note: this currently constructs an extra copy in the case
+        // `isUpperTriangleOnly == false`. This could be avoided, e.g., by a
+        // direct conversion from Eigen to a `SuiteSparseMatrix` with
+        // `SymmetryMode::UPPER_TRIANGULAR` followed by a std::move.
+        if (isUpperTriangleOnly) return fromScalar(A.toSymmetryMode(SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE));
+        else return fromScalar(std::move(A));
+    }
 
     // When `ContiguousBlocks` is true, the `BlockCSCHessian` values array
     // differs from the corresponding values array of `scalarHsp` (which must

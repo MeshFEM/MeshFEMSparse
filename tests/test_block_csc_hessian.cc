@@ -141,6 +141,15 @@ void runTest() {
         REQUIRE_THAT(scalarH.trace(), Catch::Matchers::WithinRel(blockH->trace(), 1e-10)); // Equality won't be exact with MESHFEM_VECTORIZE enabled...
     }
 
+    // Validate round-tripping of Eigen conversions in the scalar case.
+    if constexpr (VS::MaxBlockDim == 1) {
+        auto H_eig = blockH->toEigen(/* upperTriangleOnly = */ true);
+        auto blockH_from_eig = BlockCSCHessianBase::fromEigen(H_eig);
+        REQUIRE((blockH->data() - blockH_from_eig->data()).norm() == 0.0);
+        REQUIRE((blockH->Ai - blockH_from_eig->Ai).norm() == 0.0);
+        REQUIRE((Eigen::Map<VecX_T<SuiteSparse_long>>(blockH->Ap.data(), blockH->Ap.size()) - Eigen::Map<VecX_T<SuiteSparse_long>>(blockH_from_eig->Ap.data(), blockH_from_eig->Ap.size())).norm() == 0.0);
+    }
+
     // Validate `addWithSubSparsityFast`
     {
         BorderedSparseHessian H_subset(std::move(blockHsp_subset));
