@@ -1,13 +1,8 @@
 #include "AccelerateFactorizer.hh"
-#include "CholmodFactorizer.hh"
-
-#if !MESHFEM_WITH_CHOLMOD
-struct cholmod_common { };
-#endif
 
 namespace MeshFEM {
 
-#if __APPLE__ && MESHFEM_WITH_CHOLMOD
+#if __APPLE__
 
 AccelerateFactorizer::AccelerateFactorizer() {
     m_opts.control = SparseDefaultControl;
@@ -159,25 +154,7 @@ void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &
         m_opts.orderMethod = SparseOrderMetis;
     }
     else if (orderingMethod == OrderingMethod::CholmodAMD) {
-        if (!m_c) {
-            m_c = std::make_unique<cholmod_common>();
-            cholmod_l_start(m_c.get());
-        }
-
-        BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_l_amd");
-
-        auto cholmat = cholmod_sparse_view(*A_reduced);
-        // Note: the array `cholmat.x` apparently must be valid or cholmod_l_nested_dissection fails
-        // (even though the Nested dissection algorithm should not be
-        // looking at its entries...)
-        // Presumably this is because the first step of cholmod_l_nested_dissection
-        // is to convert the matrix from upper-triangular to full format.
-        // In the future, we should bypass this step since we already do the
-        // conversion ourselves for Catamari.
-        cholmat.x = dummy_values_ptr(A_reduced->Ai.data(), A_reduced->Ai.size(), m_valuesDummy);
-        VecX_T<SuiteSparse_long> iperm(A_reduced->m);
-        cholmod_l_amd(&cholmat, /* fset = */ nullptr, /* fsize = */ 0,
-                      (SuiteSparse_long *) iperm.data(), m_c.get());
+        auto iperm = m_cholmodOrdering.inversePermutation<SuiteSparse_long>(*A_reduced, CholmodOrdering::Method::AMD);
         m_customOrder.resize(iperm.size());
         for (int i = 0; i < iperm.size(); ++i)
             m_customOrder[iperm[i]] = i;
@@ -186,37 +163,12 @@ void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &
         m_opts.order = m_customOrder.data();
     }
     else if (orderingMethod == OrderingMethod::Nesdis) {
-        if (!m_c) {
-            m_c = std::make_unique<cholmod_common>();
-            cholmod_l_start(m_c.get());
-        }
-
-        {
-            auto cholmat = cholmod_sparse_view(*A_reduced);
-            // Note: the array `cholmat.x` apparently must be valid or cholmod_l_nested_dissection fails
-            // (even though the Nested dissection algorithm should not be
-            // looking at its entries...)
-            // Presumably this is because the first step of cholmod_l_nested_dissection
-            // is to convert the matrix from upper-triangular to full format.
-            // In the future, we should bypass this step since we already do the
-            // conversion ourselves for Catamari.
-            cholmat.x = dummy_values_ptr(A_reduced->Ai.data(), A_reduced->Ai.size(), m_valuesDummy);
-
-            VecX_T<SuiteSparse_long> iperm(A_reduced->m);
-            VecX_T<SuiteSparse_long> CParent(A_reduced->m), CMember(A_reduced->m);
-            {
-                BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_l_nested_dissection");
-                cholmod_l_nested_dissection(&cholmat, /* fset = */ nullptr, /* fsize = */ 0,
-                                            (SuiteSparse_long *) iperm.data(),
-                                            CParent.data(), CMember.data(), m_c.get());
-            }
-            m_customOrder.resize(iperm.size());
-            for (int i = 0; i < iperm.size(); ++i)
-                m_customOrder[iperm[i]] = i;
-            m_valuesDummy.resize(0);
-            m_opts.orderMethod = SparseOrderUser;
-            m_opts.order = m_customOrder.data();
-        }
+        auto iperm = m_cholmodOrdering.inversePermutation<SuiteSparse_long>(*A_reduced, CholmodOrdering::Method::NestedDissection);
+        m_customOrder.resize(iperm.size());
+        for (int i = 0; i < iperm.size(); ++i)
+            m_customOrder[iperm[i]] = i;
+        m_opts.orderMethod = SparseOrderUser;
+        m_opts.order = m_customOrder.data();
     }
     else {
         throw std::runtime_error("Unexpected ordering method");
@@ -328,20 +280,13 @@ void AccelerateFactorizer::solveRawReduced(const Real *b,
     SparseSolve(m_numfactor->factor, rhs, sol);
 }
 
-AccelerateFactorizer::~AccelerateFactorizer() {
-    if (m_c) cholmod_l_finish(m_c.get());
-    if (m_c_int) cholmod_finish(m_c_int.get());
-}
+AccelerateFactorizer::~AccelerateFactorizer() = default;
 
-#else // __APPLE__ && MESHFEM_WITH_CHOLMOD
+#else // __APPLE__
 
 namespace {
 [[noreturn]] void throw_accelerate_unavailable() {
-#ifdef __APPLE__
-    throw std::runtime_error("AccelerateFactorizer requires CHOLMOD support in this build.");
-#else
     throw std::runtime_error("AccelerateFactorizer is only available on Apple platforms.");
-#endif
 }
 }
 

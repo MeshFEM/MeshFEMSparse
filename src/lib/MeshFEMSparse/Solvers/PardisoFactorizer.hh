@@ -2,14 +2,7 @@
 #define PARDISOFACTORIZER_HH
 
 #include "CholeskyFactorizerBase.hh"
-
-#if MESHFEM_WITH_CHOLMOD
-extern "C" {
-#include <cholmod.h>
-}
-#else
-struct cholmod_common;
-#endif
+#include "cholmod_ordering.hh"
 
 namespace MeshFEM {
 
@@ -89,7 +82,7 @@ struct MESHFEM_EXPORT PardisoFactorizer final : public CholeskyFactorizerBase {
         return m_customOrder.array() - 1;
     }
 
-    OrderingMethod orderingMethod = OrderingMethod::Metis;
+    OrderingMethod orderingMethod = OrderingMethod::ParallelMetis;
 
     ~PardisoFactorizer();
 private:
@@ -122,8 +115,7 @@ private:
     mutable double ddum = 0; // Double dummy
     mutable int    nrhs = 1; // Number of right-hand sides in the solve phase.
 
-    std::unique_ptr<cholmod_common> m_c, m_c_int; // Used for Cholmod's ordering routines
-    VecX_T<double> m_valuesDummy; // Needed to run `cholmod_l_nested_dissection` without values in certain cases.
+    CholmodOrdering m_cholmodOrdering;
     mutable VecX_T<int> m_customOrder;
 };
 

@@ -5,7 +5,7 @@
 #if MESHFEM_WITH_PARDISO || MESHFEM_WITH_MKL_PARDISO
 #include "PardisoFactorizer.hh"
 #endif
-#if __APPLE__ && MESHFEM_WITH_CHOLMOD
+#if __APPLE__
 #include "AccelerateFactorizer.hh"
 #endif
 
@@ -22,7 +22,7 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
             throw std::runtime_error("Compiled without Pardiso");
 #endif
         case CholeskyProvider::Accelerate:
-#if __APPLE__ && MESHFEM_WITH_CHOLMOD
+#if __APPLE__
             return std::make_unique<AccelerateFactorizer>();
 #else
             throw std::runtime_error("Compiled without Accelerate");

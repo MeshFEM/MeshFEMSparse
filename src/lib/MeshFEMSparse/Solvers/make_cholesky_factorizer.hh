@@ -17,10 +17,14 @@ enum class CholeskyProviderHint { CheapSymbolic, CheapNumeric, None };
 
 inline CholeskyProvider get_default_cholesky_provider(CholeskyProviderHint hint = CholeskyProviderHint::None) noexcept {
 #if MESHFEM_WITH_CATAMARI
+#if MESHFEM_WITH_CHOLMOD
     if (hint == CholeskyProviderHint::CheapSymbolic) return CholeskyProvider::CatamariAMD;
     if (hint == CholeskyProviderHint::CheapNumeric)  return CholeskyProvider::CatamariNesdis;
     return CholeskyProvider::CatamariAdaptive;
 #else
+	return CholeskyProvider::Catamari;
+#endif // MESHFEM_WITH_CHOLMOD
+#else  // !MESHFEM_WITH_CATAMARI
     return CholeskyProvider::CHOLMOD;
 #endif
 }

@@ -1,5 +1,4 @@
 #include "PardisoFactorizer.hh"
-#include "CholmodFactorizer.hh"
 
 #include <stdexcept>
 #include <tbb/partitioner.h>
@@ -30,8 +29,6 @@ void pardiso(void *, const int *, const int *, const int *, const int *, const i
 #endif
 
 namespace MeshFEM {
-
-#if MESHFEM_WITH_CHOLMOD
 
 PardisoFactorizer::PardisoFactorizer() {
     int error = 0;
@@ -223,48 +220,14 @@ void PardisoFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const st
 #endif
     }
     else if (orderingMethod == OrderingMethod::CholmodAMD) {
-        if (!m_c_int) {
-            m_c_int = std::make_unique<cholmod_common>();
-            cholmod_start(m_c_int.get());
-        }
-
-        BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_amd");
-        VecX_T<int> Ai_downcast, Ap_downcast;
-        Ai_downcast = Eigen::Map<const VecX_T<SuiteSparse_long>>(A_reduced->Ai.data(), A_reduced->Ai.size()).template cast<int>();
-        Ap_downcast = Eigen::Map<const VecX_T<SuiteSparse_long>>(A_reduced->Ap.data(), A_reduced->Ap.size()).template cast<int>();
-        auto cholmat_downcast = cholmod_sparse_view(A_reduced->m, A_reduced->n, A_reduced->nz, dummy_values_ptr(A_reduced->Ai.data(), A_reduced->Ai.size(), m_valuesDummy),
-                                                    Ai_downcast.data(), Ap_downcast.data());
-
-        VecX_T<int> iperm(A_reduced->m);
-        cholmod_amd(&cholmat_downcast, /* fset = */ nullptr, /* fsize = */ 0, iperm.data(), m_c_int.get());
+        auto iperm = m_cholmodOrdering.inversePermutation<int>(*A_reduced, CholmodOrdering::Method::AMD);
         m_customOrder = iperm.array() + 1; // Pardiso permutation array is 1-based
 
         iparm[4] = 1; // Use user-provided permutation
     }
     else if (orderingMethod == OrderingMethod::CholmodNesdis) {
-        if (!m_c_int) {
-            m_c_int = std::make_unique<cholmod_common>();
-            cholmod_start(m_c_int.get());
-        }
-
-        {
-            VecX_T<int> Ai_downcast, Ap_downcast;
-            Ai_downcast = Eigen::Map<const VecX_T<SuiteSparse_long>>(A_reduced->Ai.data(), A_reduced->Ai.size()).template cast<int>();
-            Ap_downcast = Eigen::Map<const VecX_T<SuiteSparse_long>>(A_reduced->Ap.data(), A_reduced->Ap.size()).template cast<int>();
-            auto cholmat_downcast = cholmod_sparse_view(A_reduced->m, A_reduced->n, A_reduced->nz, dummy_values_ptr(A_reduced->Ai.data(), A_reduced->Ai.size(), m_valuesDummy),
-                                                        Ai_downcast.data(), Ap_downcast.data());
-
-            VecX_T<int> iperm(A_reduced->m);
-            VecX_T<int> CParent(A_reduced->m), CMember(A_reduced->m);
-            {
-                BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_nested_dissection");
-                cholmod_nested_dissection(&cholmat_downcast, /* fset = */ nullptr, /* fsize = */ 0,
-                                          iperm.data(), CParent.data(), CMember.data(), m_c_int.get());
-            }
-            m_customOrder = iperm.array() + 1; // Pardiso permutation array is 1-based
-            m_valuesDummy.resize(0);
-        }
-
+        auto iperm = m_cholmodOrdering.inversePermutation<int>(*A_reduced, CholmodOrdering::Method::NestedDissection);
+        m_customOrder = iperm.array() + 1; // Pardiso permutation array is 1-based
         iparm[4] = 1; // Use user-provided permutation
     }
 
@@ -403,40 +366,6 @@ void PardisoFactorizer::solveRawReduced(const Real *b, Real *x, CholeskySys sys,
 
 PardisoFactorizer::~PardisoFactorizer()  {
     m_pardisoRelease();
-
-    if (m_c) cholmod_l_finish(m_c.get());
-    if (m_c_int) cholmod_finish(m_c_int.get());
 }
-
-#else
-
-} // namespace MeshFEM
-
-struct cholmod_common { };
-
-namespace MeshFEM {
-
-namespace {
-[[noreturn]] void throw_cholmod_required() {
-    throw std::runtime_error("PardisoFactorizer requires CHOLMOD support in this build.");
-}
-}
-
-PardisoFactorizer::PardisoFactorizer() { }
-
-void PardisoFactorizer::m_pardisoRelease() { }
-void PardisoFactorizer::m_pardisoFactorization(int) { throw_cholmod_required(); }
-void PardisoFactorizer::m_setValuesFromSource(const SuiteSparseMatrix &, Real) { throw_cholmod_required(); }
-
-void PardisoFactorizer::factorizeSymbolic(const BlockCSCHessianBase &, const std::vector<size_t> &) { throw_cholmod_required(); }
-void PardisoFactorizer::factorizeSymbolic(const SuiteSparseMatrix &, const std::vector<size_t> &) { throw_cholmod_required(); }
-void PardisoFactorizer::factorizeNumeric(const SuiteSparseMatrix &, bool) { throw_cholmod_required(); }
-void PardisoFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &, Real, const SuiteSparseMatrix &, bool) { throw_cholmod_required(); }
-void PardisoFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &, Real, bool) { throw_cholmod_required(); }
-void PardisoFactorizer::solveRawReduced(const Real *, Real *, CholeskySys, bool) const { throw_cholmod_required(); }
-
-PardisoFactorizer::~PardisoFactorizer() = default;
-
-#endif
 
 } // namespace MeshFEM

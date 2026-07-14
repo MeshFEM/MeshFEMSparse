@@ -2,17 +2,13 @@
 #define CATAMARIFACTORIZER_HH
 
 #include "CholeskyFactorizerBase.hh"
+#include "cholmod_ordering.hh"
 
 #if MESHFEM_WITH_CATAMARI
 
 #include <MeshFEMCore/Parallelism.hh>
 #include <MeshFEMCore/ParallelVectorOps.hh>
 
-extern "C" {
-#include <cholmod.h>
-}
-
-#include <SuiteSparse_config.h>
 #include <MeshFEM_export.h>
 
 #if MESHFEM_WITH_SCOTCH
@@ -122,7 +118,12 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
 
     virtual ~CatamariFactorizer();
 
-    OrderingMethod orderingMethod = OrderingMethod::CholmodNesdis;
+    OrderingMethod orderingMethod =
+#if MESHFEM_WITH_CHOLMOD
+        OrderingMethod::CholmodNesdis;
+#else
+        OrderingMethod::Catamari;
+#endif
 
     struct OrderingChoices {
         static constexpr OrderingMethod   primary_method = OrderingMethod::CholmodNesdis;
@@ -187,7 +188,7 @@ private:
 
     std::unique_ptr<CatamariConverter> m_catamariConverter;
 
-    std::unique_ptr<cholmod_common> m_c, m_c_int; // Used for Cholmod's ordering routines
+    CholmodOrdering m_cholmodOrdering;
     size_t m_blockSize = 1;
     size_t m_useBlockAccel = true;
 
@@ -199,7 +200,6 @@ private:
 
     mutable Eigen::VectorXd m_permuted_rhs_scratch;
 
-    Eigen::VectorXd m_valuesDummy; // Needed to run `cholmod_l_nested_dissection` without values in certain cases.
 };
 
 } // namespace MeshFEM

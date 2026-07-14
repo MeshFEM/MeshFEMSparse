@@ -7,16 +7,9 @@
 #endif
 
 #include "CholeskyFactorizerBase.hh"
+#include "cholmod_ordering.hh"
 #include <stdexcept>
 #include <vector>
-
-#if MESHFEM_WITH_CHOLMOD
-extern "C" {
-#include <cholmod.h>
-}
-#else
-struct cholmod_common;
-#endif
 
 namespace MeshFEM {
 
@@ -177,8 +170,7 @@ private:
     // Control options
     SparseSymbolicFactorOptions m_opts;
 
-    std::unique_ptr<cholmod_common> m_c, m_c_int; // Used for Cholmod's ordering routines
-    VecX_T<double> m_valuesDummy; // Needed to run `cholmod_l_nested_dissection` without values in certain cases.
+    CholmodOrdering m_cholmodOrdering;
     VecX_T<int> m_customOrder;
 #endif
 
