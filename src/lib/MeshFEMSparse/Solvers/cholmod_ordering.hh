@@ -70,15 +70,14 @@ private:
         A.nzmax  = nz;
         A.p      = Ap;
         A.i      = Ai;
-        A.nz     = nullptr;
-        A.x      = nullptr;
-        A.z      = nullptr;
-        A.stype  = -1; // symmetric lower triangle in CHOLMOD's column-major convention
+        A.nz     = nullptr; /* not needed because `result` is packed. */
+        A.z      = nullptr; /* not needed because `result` is real. */
+        A.stype  = 1; // upper triangle stored.
         A.itype  = sizeof(Index_) == sizeof(SuiteSparse_long) ? CHOLMOD_LONG : CHOLMOD_INT;
         A.xtype  = CHOLMOD_PATTERN;
         A.dtype  = CHOLMOD_DOUBLE;
-        A.sorted = 1;
-        A.packed = 1;
+        A.sorted = true;
+        A.packed = true;
         return A;
     }
 
