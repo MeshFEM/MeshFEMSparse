@@ -24,6 +24,15 @@
 
 namespace MeshFEM {
 
+// Metaprogramming hack for determining the "return" type of stencil/element Hessian getters
+// that return via  second argument (e.g., `void operator()(size_t ei, ElementType &element)`).
+// Unlike `MeshFEMCore/function_traits.hh`, this version is robust in the
+// presence of an additional single-argument overload like `ElementType operator()(size_t ei) const`.
+template<typename T> struct type_identity { using type = T; };
+template<typename C, typename R, typename A0, typename A1> type_identity<A1> select_second_argument(R (C::*)(A0, A1) const);
+template<typename C, typename R, typename A0, typename A1> type_identity<A1> select_second_argument(R (C::*)(A0, A1));
+template<typename F> using second_argument_type_t = std::decay_t<typename decltype(select_second_argument(&F::operator()))::type>;
+
 struct VarLocks {
     void init(size_t numLocks) {
         if (m_varLocks) return;
@@ -515,6 +524,37 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
     void assembleHessian(BorderedSparseHessian &BH, Args&&... args) const {
         if (!BH.H_ss) throw std::runtime_error("Attempted to assemble into a BorderedSparseHessian with no block sparsity pattern.");
         assembleHessian<UseBlockMergeAlgorithm>(*BH.H_ss, std::forward<Args>(args)...);
+    }
+
+    // Version where we don't know the per-element Hessian size at compile time
+    // and therefore need to use dynamic-sized arrays for the element
+    // contributions and stencils.
+    // To minimize memory allocation overhead, we share these arrays across
+    // elements processed by the same thread.
+    template<bool UseBlockMergeAlgorithm = UseBlockMergeAlgorithmDefault, class PEHEval, class ElementGetter>
+    void assembleHessianDynamicPEH(BlockCSCHessianBase &H_base, size_t numElements, const PEHEval &eval_He, const ElementGetter &element) const {
+        auto &H = BCSCMat::cast(H_base);
+        if (H.isSparsityOnly()) H.setZero(); // Allocate Ax array if necessary
+                                             // (and accumulate to existing Ax array otherwise)
+        Real *Ax = H_base.Ax.data();
+
+        // Detect the array types from the second argument of the function call operators.
+        using PEH   = second_argument_type_t<PEHEval>;       // Usually Eigen::MatrixXd
+        using EVars = second_argument_type_t<ElementGetter>; // e.g., std::vector<int>
+
+        using HEAD = HessianElementAssemblyData<PEH, EVars>;
+        tbb::enumerable_thread_specific<HEAD> threadLocalData;
+
+        m_varLocks.init(numBlockVars());
+        get_hessian_assembly_arena().execute([Ax, &H, &threadLocalData, &eval_He, &element, numElements, this]() {
+            parallel_for_range(numElements, [Ax, &H, &threadLocalData, &eval_He, &element, this](size_t ei) {
+                HEAD &edata = threadLocalData.local();
+                eval_He(ei, edata.H_e);
+                element(ei, edata.evars);
+                auto He_block = [&edata](size_t a, size_t b, size_t bsa, size_t bsb) { return edata.block(a, b, bsa, bsb); };
+                ElementHessianContribAssembler<UseBlockMergeAlgorithm>::template run</* InParallel = */ true>(Ax, H, He_block, edata.evars, m_vars, m_varLocks);
+            }, 1, 32);
+        });
     }
 
     ////////////////////////////////////////////////////////////////////////////
