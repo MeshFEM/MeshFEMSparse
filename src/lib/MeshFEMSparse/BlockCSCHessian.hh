@@ -622,8 +622,8 @@ struct MESHFEM_EXPORT BlockCSCHessianBase : public SuiteSparseMatrix {
         auto H_scalar = toScalar();
 
         if (!fixedVars.empty()) {
-            std::vector<bool> isFixed(n, false);
-            for (size_t v : fixedVars) isFixed[v] = true;
+            std::vector<bool> isFixed(H_scalar.n, false);
+            for (size_t v : fixedVars) isFixed.at(v) = true;
             H_scalar.rowColRemoval([&isFixed](size_t v) { return isFixed[v]; });
         }
 
@@ -658,13 +658,13 @@ struct MESHFEM_EXPORT BlockCSCHessianBase : public SuiteSparseMatrix {
         Eigen::Map<VecX_T<SuiteSparse_long>>(A.Ap.data(), A.Ap.size()) = Ap_map.template cast<dst_index_type>();
         A.Ai = Ai_map.template cast<dst_index_type>();
         A.Ax.assign(A_eigen.valuePtr(), A_eigen.valuePtr() + A.nz);
-        A.symmetry_mode = SuiteSparseMatrix::SymmetryMode::NONE;
+        A.symmetry_mode = isUpperTriangleOnly ? SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE : SuiteSparseMatrix::SymmetryMode::NONE;
 
         // Note: this currently constructs an extra copy in the case
         // `isUpperTriangleOnly == false`. This could be avoided, e.g., by a
         // direct conversion from Eigen to a `SuiteSparseMatrix` with
         // `SymmetryMode::UPPER_TRIANGULAR` followed by a std::move.
-        if (isUpperTriangleOnly) return fromScalar(A.toSymmetryMode(SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE));
+        if (!isUpperTriangleOnly) return fromScalar(A.toSymmetryMode(SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE));
         else return fromScalar(std::move(A));
     }
 
