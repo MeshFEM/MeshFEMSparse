@@ -530,8 +530,10 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
     // and therefore need to use dynamic-sized arrays for the element
     // contributions and stencils.
     // To minimize memory allocation overhead, we share these arrays across
-    // elements processed by the same thread.
-    template<bool UseBlockMergeAlgorithm = UseBlockMergeAlgorithmDefault, class PEHEval, class ElementGetter>
+    // elements processed by the same thread. Also, in this case we expect the
+    // binary-search-based assembly algorithm to be faster than
+    // sort-and-merge due to the inability to use a fast static sort.
+    template<bool UseBlockMergeAlgorithm = false, class PEHEval, class ElementGetter>
     void assembleHessianDynamicPEH(BlockCSCHessianBase &H_base, size_t numElements, const PEHEval &eval_He, const ElementGetter &element) const {
         auto &H = BCSCMat::cast(H_base);
         if (H.isSparsityOnly()) H.setZero(); // Allocate Ax array if necessary

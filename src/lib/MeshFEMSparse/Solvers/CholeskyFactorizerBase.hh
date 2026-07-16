@@ -388,7 +388,7 @@ protected:
             return &mat;
         }
 
-        m_Areduced = std::make_unique<SuiteSparseMatrix>(mat);
+        m_Areduced = std::make_unique<SuiteSparseMatrix>(mat, /* sparsityOnly = */ true);
 
         // Deduplicate fixed vars and construct mask needed for efficient row/col removal.
         m_fixedVars.clear();
