@@ -17,7 +17,7 @@ function(meshfem_download_catamari)
     meshfem_prepare_editable_repo(catamari
         "${MESHFEM_EXTERNAL}/catamari" master)
     FetchContent_Declare(catamari
-        GIT_REPOSITORY git@github.com:MeshFEM/catamari_dev.git
+        GIT_REPOSITORY https://github.com/MeshFEM/BlockCatamari.git
         GIT_TAG        master
         SOURCE_DIR     ${MESHFEM_EXTERNAL}/catamari
     )

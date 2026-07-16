@@ -33,8 +33,8 @@ endif()
 
 if(NOT TARGET MeshFEMCore)
     include(FetchContent)
-    # TODO: change these to pinned tags and https once public.
-    set(MESHFEMCORE_GIT_REPOSITORY "git@github.com:MeshFEM/MeshFEMCore.git"
+    # TODO: change these to pinned tags
+    set(MESHFEMCORE_GIT_REPOSITORY "https://github.com/MeshFEM/MeshFEMCore.git"
         CACHE STRING "MeshFEMCore git repository")
     set(MESHFEMCORE_GIT_TAG "main"
         CACHE STRING "MeshFEMCore git revision")
