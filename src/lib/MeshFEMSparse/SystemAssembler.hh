@@ -15,6 +15,7 @@
 #include <atomic>
 #include <tuple>
 #include <functional>
+#include <tbb/enumerable_thread_specific.h>
 #include <MeshFEMSparse/SparseMatrices.hh>
 #include <MeshFEMSparse/Utilities/argsort.hh>
 
@@ -338,12 +339,16 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
             // the much larger duplicate-filled lists.
             // We use a thread-local "patternFlags" array to mark which row
             // indices have already been seen in the current column.
-            tbb::enumerable_thread_specific<Eigen::Matrix<size_t, Eigen::Dynamic, 1>> threadPatternFlags;
+            for (auto &scratch : m_threadPatternFlags)
+                scratch.needsReset = true;
 
             tbb::parallel_for(tbb::blocked_range<size_t>(0, n), [&](const tbb::blocked_range<size_t> &r) {
-                auto &patternFlags = threadPatternFlags.local();
-                if (size_t(patternFlags.size()) != n)
+                auto &scratch = m_threadPatternFlags.local();
+                auto &patternFlags = scratch.patternFlags;
+                if (scratch.needsReset) {
                     patternFlags.setConstant(n, -1);
+                    scratch.needsReset = false;
+                }
                 for (size_t j = r.begin(); j != r.end(); ++j) {
                     RowIndex *start = columnBuckets.data() + bucketStart[j];
                     RowIndex *end   = columnBuckets.data() + bucketStart[j + 1];
@@ -955,6 +960,11 @@ private:
     }
 
     mutable std::vector<char> m_sparsityChangeDetectionScratch;
+    struct ThreadPatternFlagsScratch {
+        Eigen::Matrix<size_t, Eigen::Dynamic, 1> patternFlags;
+        bool needsReset = true;
+    };
+    mutable tbb::enumerable_thread_specific<ThreadPatternFlagsScratch> m_threadPatternFlags;
     mutable VarLocks m_varLocks;
     VarStructure m_vars;
 };
