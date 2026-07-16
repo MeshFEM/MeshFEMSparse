@@ -157,7 +157,7 @@ struct MESHFEM_EXPORT BorderedSparseHessian {
     // already have diagonal blocks for positive definiteness.
     void insertSparsityPatternDiagonalBlocksIfNeeded() {
         if (!H_ss || !(H_ss->missingRequiredDiagonalBlocks())) return;
-        auto copy = H_ss->clone();
+        auto copy = H_ss->emptyClone();
         copy->setIdentity();
         H_ss->mergeSparsityPattern(*copy);
         H_ss->finalize();

@@ -611,6 +611,7 @@ struct MESHFEM_EXPORT BlockCSCHessianBase : public SuiteSparseMatrix {
 
     virtual void assertSupportsAssembly() const = 0;
     virtual bool missingRequiredDiagonalBlocks() const = 0;
+    virtual size_t numDiagonalBlocks() const = 0;
 
     virtual SuiteSparseMatrix toScalar(bool sparsityOnly = false) const = 0;
     static std::unique_ptr<BlockCSCHessianBase> fromScalar(const SuiteSparseMatrix &m);
@@ -719,6 +720,7 @@ struct MESHFEM_EXPORT BlockCSCHessianBase : public SuiteSparseMatrix {
 
     virtual const OptimizationVarStructureBase   &vars() const = 0;
     virtual std::unique_ptr<BlockCSCHessianBase> clone() const = 0;
+    virtual std::unique_ptr<BlockCSCHessianBase> emptyClone() const = 0; // Construct an empty matrix with the same block variable structure
 
     virtual bool hasContiguousBlocks() const = 0;
     virtual std::unique_ptr<BlockCSCHessianBase> cloneWithNoncontiguousBlocks() const = 0;
@@ -795,7 +797,7 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
 
     virtual size_t numScalarCols() const override { return m_vars.numSparseVars(); }
 
-    size_t numDiagonalBlocks() const {
+    virtual size_t numDiagonalBlocks() const override {
         size_t numBlocks = Ai.size();
         size_t result = 0;
         for (_Index j = 0; j < n; ++j) {
@@ -1211,6 +1213,7 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
     }
 
     std::unique_ptr<BlockCSCHessianBase> clone() const override;
+    std::unique_ptr<BlockCSCHessianBase> emptyClone() const override { return construct(m_vars); }
 
     bool hasContiguousBlocks() const override { return ContiguousBlocks; }
     std::unique_ptr<BlockCSCHessianBase> cloneWithNoncontiguousBlocks() const override {
