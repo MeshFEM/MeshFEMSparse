@@ -1171,7 +1171,11 @@ struct CSCMatrix {
                 for (_Index block_j = 0; block_j < blockHsp.n; ++block_j) {
                     size_t gvar_j = block_j * N;
                     size_t numBlocks = blockHsp.Ap[block_j + 1] - blockHsp.Ap[block_j];
-                    bool hasDiagonal = AssumeDiagonalExists || (blockHsp.Ai[blockHsp.Ap[block_j + 1] - 1] == block_j);
+                    // Guard against empty block columns (possible, e.g., for contact
+                    // Hessians, where most vertices are collision-free): reading
+                    // Ai[Ap[block_j + 1] - 1] would be out of bounds, and a spurious
+                    // `hasDiagonal` would underflow `colSize` below.
+                    bool hasDiagonal = (numBlocks > 0) && (AssumeDiagonalExists || (blockHsp.Ai[blockHsp.Ap[block_j + 1] - 1] == block_j));
                     if (hasDiagonal) {
                         size_t colSize = (numBlocks - 1) * N + 1;
                         for (size_t c_j = 0; c_j < N; ++c_j)
