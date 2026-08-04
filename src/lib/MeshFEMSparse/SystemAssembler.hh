@@ -16,6 +16,7 @@
 #include <tuple>
 #include <functional>
 #include <tbb/enumerable_thread_specific.h>
+#include <MeshFEM_export.h>
 #include <MeshFEMSparse/SparseMatrices.hh>
 #include <MeshFEMSparse/Utilities/argsort.hh>
 
@@ -723,8 +724,8 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
         static_assert(PEG::SizeAtCompileTime > 0, "Per-element gradient currently must be of compile-time-known size for scatter-gather assembly");
         static_assert(VarStructure::SingleBlockDim, "Only SingleBlockDim case is implemented");
 
-        constexpr size_t numElemLocalVars = PEG::SizeAtCompileTime;
-        constexpr size_t N = VarStructure::FirstBlockDim;
+        static constexpr size_t numElemLocalVars = PEG::SizeAtCompileTime;
+        static constexpr size_t N = VarStructure::FirstBlockDim;
         static constexpr int numBlockVarsPerElement = numElemLocalVars / N;
 
         if (!gatherCache) {
