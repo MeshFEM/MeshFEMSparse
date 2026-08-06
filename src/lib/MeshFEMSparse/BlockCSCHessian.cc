@@ -1,6 +1,7 @@
 #include <MeshFEMSparse/BlockCSCHessian.hh>
 #include <MeshFEMSparse/BlockCSCHessianDynCastWorkaround.hh> // NOLINT
 #include <MeshFEMSparse/VarStructure.hh>
+#include "Utilities/compress_sparsity_pattern.hh"
 
 namespace MeshFEM {
 
@@ -91,9 +92,10 @@ std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianBase::constructFromBinaryStr
     is.read(reinterpret_cast<char *>(&numBlocks), sizeof(numBlocks));
 
     std::unique_ptr<BlockCSCHessianBase> result;
-    if (blockSize == 1) result = BlockCSCHessian<OptimizationVarStructure<1>, false>::construct(OptimizationVarStructure<1>(numBlocks));
-    if (blockSize == 2) result = BlockCSCHessian<OptimizationVarStructure<2>, false>::construct(OptimizationVarStructure<2>(numBlocks));
-    if (blockSize == 3) result = BlockCSCHessian<OptimizationVarStructure<3>, false>::construct(OptimizationVarStructure<3>(numBlocks));
+    static constexpr bool ContiguousBlocks = false; // for historical reasons, the binary format always uses the noncontiguous block layout.
+    if (blockSize == 1) result = BlockCSCHessian<OptimizationVarStructure<1>, ContiguousBlocks>::construct(OptimizationVarStructure<1>(numBlocks));
+    if (blockSize == 2) result = BlockCSCHessian<OptimizationVarStructure<2>, ContiguousBlocks>::construct(OptimizationVarStructure<2>(numBlocks));
+    if (blockSize == 3) result = BlockCSCHessian<OptimizationVarStructure<3>, ContiguousBlocks>::construct(OptimizationVarStructure<3>(numBlocks));
     if (!result) throw std::runtime_error("constructFromBinaryStream: uninstantiated block size");
     result->readBinaryFromStream(is);
 
@@ -101,13 +103,41 @@ std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianBase::constructFromBinaryStr
     return result;
 }
 
-std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianBase::fromScalar(const SuiteSparseMatrix &A) {
+template<bool ContiguousBlocks = ContiguousBlocksDefault>
+std::unique_ptr<BlockCSCHessianBase> compressFromScalar(const SuiteSparseMatrix &A, int blockSize) {
+    using _Index = BlockCSCHessianBase::_Index;
+    std::unique_ptr<BlockCSCHessianBase> result;
+    std::vector<_Index> blockAi, blockAp;
+    if (A.m != A.n) throw std::runtime_error("compressFromScalar: only square matrices supported");
+    if (A.n % blockSize != 0) throw std::runtime_error("compressFromScalar: size must be divisible by blockSize");
+    _Index numBlocks = A.n / blockSize;
+
+    if (blockSize == 2) result = BlockCSCHessian<OptimizationVarStructure<2>, ContiguousBlocks>::construct(OptimizationVarStructure<2>(numBlocks));
+    if (blockSize == 3) result = BlockCSCHessian<OptimizationVarStructure<3>, ContiguousBlocks>::construct(OptimizationVarStructure<3>(numBlocks));
+    if (!result) throw std::runtime_error("compressFromScalar: uninstantiated block size");
+
+    compress_sparsity_pattern(A.Ai.data(), A.Ap.data(), A.n, blockSize, blockAi, blockAp, /* keepUpperTriangleOnly = */ true);
+
+    result->m = result->n = numBlocks;
+    result->Ai = Eigen::Map<VecX_T<_Index>>(blockAi.data(), blockAi.size());
+    result->Ap = std::move(blockAp);
+    result->nz = result->Ai.size();
+    result->finalize();
+
+    if (!A.isSparsityOnly()) result->addWithSubSparsityScalarCSC(A.Ap.data(), A.Ai.data(), A.Ax.data());
+
+    return result;
+}
+
+std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianBase::fromScalar(const SuiteSparseMatrix &A, int blockSize) {
+    if (blockSize != 1) return compressFromScalar(A, blockSize);
     auto result = BlockCSCHessian<OptimizationVarStructure<1>, false>::construct(OptimizationVarStructure<1>(size_t(A.m)));
     result->SuiteSparseMatrix::operator=(A);
     return result;
 }
 
-std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianBase::fromScalar(SuiteSparseMatrix &&A) {
+std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianBase::fromScalar(SuiteSparseMatrix &&A, int blockSize) {
+    if (blockSize != 1) return compressFromScalar(A, blockSize);
     auto result = BlockCSCHessian<OptimizationVarStructure<1>, false>::construct(OptimizationVarStructure<1>(size_t(A.m)));
     result->SuiteSparseMatrix::operator=(std::move(A));
     return result;

@@ -199,6 +199,18 @@ void runTest() {
         REQUIRE(scalarH_id.trace() == scalarH_id_compare.trace());
         REQUIRE(scalarH_id.data().sum() == scalarH_id_compare.data().sum());
     }
+
+    // Validate round-tripping of scalar <==> BlockCSCHessian
+    // (This is currently only supported for BCSC-type format, i.e., single-block-dimension and
+    // the default contiguous-blocks storage layout; eventually we may expose
+    // more options for the `fromScalar` conversion).
+    if (VS::SingleBlockDim && (ContiguousBlocks == ContiguousBlocksDefault)) {
+        auto H_scalar = blockH->toScalar();
+        auto blockH_roundtrip = BlockCSCHessianBase::fromScalar(H_scalar, VS::FirstBlockDim);
+        REQUIRE((blockH->data() - blockH_roundtrip->data()).norm() == 0.0);
+        REQUIRE((blockH->Ai - blockH_roundtrip->Ai).norm() == 0.0);
+        REQUIRE(blockH->Ap == blockH_roundtrip->Ap);
+    }
 }
 
 #include <MeshFEMSparse/BlockCSCHessianDynCastWorkaround.hh>

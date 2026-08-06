@@ -614,8 +614,11 @@ struct MESHFEM_EXPORT BlockCSCHessianBase : public SuiteSparseMatrix {
     virtual size_t numDiagonalBlocks() const = 0;
 
     virtual SuiteSparseMatrix toScalar(bool sparsityOnly = false) const = 0;
-    static std::unique_ptr<BlockCSCHessianBase> fromScalar(const SuiteSparseMatrix &m);
-    static std::unique_ptr<BlockCSCHessianBase> fromScalar(SuiteSparseMatrix &&m);
+
+    // Note that the following will drop any entries in the strict lower triangle,
+    // referencing only the upper triangle due to an assumption of symmetry.
+    static std::unique_ptr<BlockCSCHessianBase> fromScalar(const SuiteSparseMatrix &m, int blockSize = 1);
+    static std::unique_ptr<BlockCSCHessianBase> fromScalar(SuiteSparseMatrix &&m, int blockSize = 1);
 
     template<typename index_type = int>
     Eigen::SparseMatrix<double, Eigen::ColMajor, index_type>
@@ -695,6 +698,7 @@ struct MESHFEM_EXPORT BlockCSCHessianBase : public SuiteSparseMatrix {
     virtual void addNZBlockAtScalarLocation(size_t vi, size_t vj, const Eigen::Ref<Eigen::MatrixXd> &block) = 0;
 
     virtual void addWithSubSparsityFast(const BlockCSCHessianBase &b, const double alpha = 1.0, bool parallel = true) = 0;
+    virtual void addWithSubSparsityScalarCSC(const _Index *src_Ap, const _Index *src_Ai, const double *src_Ax, const double alpha = 1.0, bool parallel = true) = 0;
 
     template<class _InVector>
     void addDiag(const _InVector &d) {
@@ -1107,6 +1111,21 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
         }, n);
     }
 
+    // Offset of local entry (c_i, c_j) of the block at (bi, bj)
+    // relative to the upper-left entry located at `locForBlock(bi, bj)`.
+    _Index intrablockOffset(size_t bi, size_t bj, size_t c_i, size_t c_j) const {
+        if constexpr (ContiguousBlocks) {
+            static_assert(StoreFullDiagonalBlocks, "Only StoreFullDiagonalBlocks case is supported");
+            size_t bsi = m_vars.blockSize(bi);
+            return bsi * c_j + c_i;
+        }
+        else {
+           _Index stride = this->scalarColStride(bj);
+           return stride * c_j + ((c_j - 1) * c_j) / 2 // Advance to local column c_j
+               +  c_i;                                 // Move down to row c_i
+        }
+    }
+
     _Index findScalarLoc(size_t vi, size_t vj) const {
         size_t bi = m_vars.blockContainingVar(vi),
                bj = m_vars.blockContainingVar(vj);
@@ -1114,21 +1133,7 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
         size_t c_i = vi - m_vars.offsetForBlock(bi),
                c_j = vj - m_vars.offsetForBlock(bj);
 
-        // Locate local entry (c_i, c_j) of the block at (bi, bj)
-        // whose upper-left corner is at `locForBlock(bi, bj)`.
-        _Index loc = this->locForBlock(bi, bj); // upper-left corner
-        if constexpr (ContiguousBlocks) {
-            static_assert(StoreFullDiagonalBlocks, "Only StoreFullDiagonalBlocks case is supported");
-            size_t bsi = m_vars.blockSize(bi);
-            loc += bsi * c_j + c_i;
-        }
-        else {
-           _Index stride = this->scalarColStride(bj);
-           loc += stride * c_j + ((c_j - 1) * c_j) / 2 // Advance to local column c_j
-               +  c_i;                                 // Move down to row c_i
-        }
-
-        return loc;
+        return this->locForBlock(bi, bj) + intrablockOffset(bi, bj, c_i, c_j);
     }
 
     void addNZScalar(size_t vi, size_t vj, _Real val) override {
@@ -1169,6 +1174,8 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
             throw std::runtime_error("BlockCSCHessian::addWithSubSparsityFast: incompatible variable block structure");
         if (symmetry_mode != SymmetryMode::UPPER_TRIANGLE) throw std::runtime_error("addWithSubSparsityFast: only `UPPER_TRIANGLE` symmetry mode is implemented");
         const BlockCSCHessian &b = cast(b_base);
+        if (b.isSparsityOnly()) return;
+        if (isSparsityOnly()) setZero();
 
         auto addColumn = [&](_Index j) {
             if (b.col_nnz(j) == 0) return;
@@ -1210,6 +1217,55 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
         };
 
         parallel_for_range(n, addColumn, /* grain_size = */ 50, /*parallelism_threshold = */ parallel ? 500 : std::numeric_limits<size_t>::max());
+    }
+
+    // Accumulate some scalar multiple of an ordinary CSC matrix to this block-sparse Hessian.
+    // All nonzero scalar entries within the source matrix must fall within our
+    // existing nonzero blocks. Furthermore, the source matrix must have
+    // sorted row indices. Any strict lower triangle entries of the source
+    // matrix are ignored (only the upper triangle is added).
+    // Finally, the source matrix must have the same number of rows and columns:
+    // no bounds checking is performed here to keep the argument list minimal.
+    virtual void addWithSubSparsityScalarCSC(const _Index *src_Ap, const _Index *src_Ai, const _Real *src_Ax, const _Real alpha = 1.0, bool parallel = true) override {
+        if (symmetry_mode != SymmetryMode::UPPER_TRIANGLE) throw std::runtime_error("addWithSubSparsityFast: only `UPPER_TRIANGLE` symmetry mode is implemented");
+
+        if (isSparsityOnly()) setZero();
+
+        auto addBlockColumn = [&](_Index bj) {
+            const _Index bsj = m_vars.blockSize(bj);
+            const _Index bjo = m_vars.offsetForBlock(bj);
+
+            // Process all scalar columns overlapping block column bj.
+            for (_Index cj = 0; cj < bsj; ++cj) {
+                const _Index j = bjo + cj;
+                _Index src_loc = src_Ap[j];
+                const _Index src_end = src_Ap[j + 1];
+
+                auto dst_cs = columnScanner(bj);
+
+                while (src_loc < src_end) {
+                    const _Index src_row = src_Ai[src_loc];
+                    if (src_row == j) {
+                        // Fast path for diagonal entries
+                        assert(col_nnz(bj) > 0 && Ai[Ap[bj + 1] - 1] == bj && "Diagonal entry missing from destination sparsity pattern");
+                        Ax[dst_cs.diagBlockScalarLoc() + intrablockOffset(bj, bj, cj, cj)] += alpha * src_Ax[src_loc];
+                        break; // early exit (sorting assumption)
+                    }
+                    if (src_row > j) break; // Ignore lower triangle entries; terminate upon dropping below the diagonal.
+                    _Index bi = m_vars.blockContainingVar(src_row);
+
+                    while (!dst_cs.atEnd() && (bi > Ai[dst_cs.blockLoc()])) ++dst_cs;
+                    assert(!dst_cs.atEnd() && (bi == Ai[dst_cs.blockLoc()]) && "Source sparsity not a subset of destination sparsity");
+                    _Index ci = src_row - m_vars.offsetForBlock(bi);
+                    assert(ci < dst_cs.rowBlockSize() && "Scalar entry falls outside the destination block height");
+                    Ax[dst_cs.scalarLoc() + intrablockOffset(bi, bj, ci, cj)] += alpha * src_Ax[src_loc];
+
+                    ++src_loc;
+                }
+            }
+        };
+
+        parallel_for_range(n, addBlockColumn, /* grain_size = */ 50, /*parallelism_threshold = */ parallel ? 500 : std::numeric_limits<size_t>::max());
     }
 
     std::unique_ptr<BlockCSCHessianBase> clone() const override;
@@ -1331,7 +1387,7 @@ private:
     }
 
     BlockCSCHessian(const VarStructure &varStructure)
-        : BlockCSCHessianBase(varStructure.numBlocks(), varStructure.numBlocks()), m_vars(varStructure) { }
+        : BlockCSCHessianBase(varStructure.numBlocks(), varStructure.numBlocks()), m_vars(varStructure) { symmetry_mode = SymmetryMode::UPPER_TRIANGLE; }
 };
 
 } // namespace MeshFEM

@@ -40,7 +40,6 @@ BlockCSCHessian<VarStructure, ContiguousBlocks, BTSPolicy>::~BlockCSCHessian() =
 template<class VarStructure, bool ContiguousBlocks, template<class> class BTSPolicy>
 std::unique_ptr<BlockCSCHessian<VarStructure, ContiguousBlocks, BTSPolicy>> BlockCSCHessian<VarStructure, ContiguousBlocks, BTSPolicy>::construct(const VarStructure &vars) {
     std::unique_ptr<BlockCSCHessian> result(new BlockCSCHessian(vars)); // can't use `make_unique` due to private constructor
-    result->symmetry_mode = CSCMat::SymmetryMode::UPPER_TRIANGLE;
     return result;
 }
 
