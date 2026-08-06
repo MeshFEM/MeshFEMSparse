@@ -17,27 +17,38 @@
 
 #include <vector>
 #include <set>
+#include <stdexcept>
+
+#include <MeshFEMSparse/Utilities/ScalarCSCView.hh>
 
 namespace MeshFEM {
 
-template<typename Index>
-void compress_sparsity_pattern(const Index *Ai, const Index *Ap, Index n, const int blockSize, std::vector<Index> &blockAi, std::vector<Index> &blockAp, bool keepUpperTriangleOnly) {
+template<typename SrcIndex, typename DstIndex>
+void compress_sparsity_pattern(const SrcIndex *Ai, const SrcIndex *Ap, DstIndex n, const int blockSize, std::vector<DstIndex> &blockAi, std::vector<DstIndex> &blockAp, bool keepUpperTriangleOnly) {
 	if (n % blockSize != 0) throw std::runtime_error("compress_sparsity_pattern: n must be divisible by blockSize");
-	Index n_block = n / blockSize;
+	DstIndex n_block = n / blockSize;
 	blockAp.resize(n_block + 1);
 	blockAp[0] = 0;
-	for (Index bj = 0; bj < n_block; ++bj) {
+	for (DstIndex bj = 0; bj < n_block; ++bj) {
 		// TODO: faster merge-based approach if this is ever a bottleneck.
-		std::set<Index> uniqueBlocks;
-		const Index end = Ap[(bj + 1) * blockSize];
-		for (Index ii = Ap[bj * blockSize]; ii < end; ++ii) {
-			Index bi = Ai[ii] / blockSize;
+		std::set<DstIndex> uniqueBlocks;
+		const SrcIndex end = Ap[(bj + 1) * blockSize];
+		for (SrcIndex ii = Ap[bj * blockSize]; ii < end; ++ii) {
+			DstIndex bi = Ai[ii] / blockSize;
 			if (keepUpperTriangleOnly && (bi > bj)) continue;
 			uniqueBlocks.insert(bi);
 		}
 		blockAp[bj + 1] = blockAp[bj] + uniqueBlocks.size();
 		blockAi.insert(blockAi.end(), uniqueBlocks.begin(), uniqueBlocks.end());
 	}
+}
+
+template<typename Index>
+void compress_sparsity_pattern(const ScalarCSCView &src, const int blockSize, std::vector<Index> &blockAi, std::vector<Index> &blockAp, bool keepUpperTriangleOnly) {
+	if (src.rows != src.cols) throw std::runtime_error("compress_sparsity_pattern: only square matrices are supported");
+	src.visit([&](const auto *src_Ap, const auto *src_Ai, const double *) {
+		compress_sparsity_pattern(src_Ai, src_Ap, Index(src.cols), blockSize, blockAi, blockAp, keepUpperTriangleOnly);
+	});
 }
 
 } // namespace MeshFEM

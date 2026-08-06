@@ -30,6 +30,7 @@
 #include <MeshFEMSparse/SparseMatrices.hh>
 #include <MeshFEMSparse/VarStructure.hh>
 #include <MeshFEMSparse/ParallelAssembly.hh>
+#include <MeshFEMSparse/Utilities/ScalarCSCView.hh>
 
 #include <Eigen/Sparse>
 
@@ -698,7 +699,7 @@ struct MESHFEM_EXPORT BlockCSCHessianBase : public SuiteSparseMatrix {
     virtual void addNZBlockAtScalarLocation(size_t vi, size_t vj, const Eigen::Ref<Eigen::MatrixXd> &block) = 0;
 
     virtual void addWithSubSparsityFast(const BlockCSCHessianBase &b, const double alpha = 1.0, bool parallel = true) = 0;
-    virtual void addWithSubSparsityScalarCSC(const _Index *src_Ap, const _Index *src_Ai, const double *src_Ax, const double alpha = 1.0, bool parallel = true) = 0;
+    virtual void addWithSubSparsityScalarCSC(const ScalarCSCView &src, const double alpha = 1.0, bool parallel = true) = 0;
 
     template<class _InVector>
     void addDiag(const _InVector &d) {
@@ -1226,9 +1227,11 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
     // matrix are ignored (only the upper triangle is added).
     // Finally, the source matrix must have the same number of rows and columns:
     // no bounds checking is performed here to keep the argument list minimal.
-    virtual void addWithSubSparsityScalarCSC(const _Index *src_Ap, const _Index *src_Ai, const _Real *src_Ax, const _Real alpha = 1.0, bool parallel = true) override {
+    template<typename SrcIdx>
+    void addWithSubSparsityScalarCSCImpl(const SrcIdx *src_Ap, const SrcIdx *src_Ai, const _Real *src_Ax, const _Real alpha = 1.0, bool parallel = true) {
         if (symmetry_mode != SymmetryMode::UPPER_TRIANGLE) throw std::runtime_error("addWithSubSparsityFast: only `UPPER_TRIANGLE` symmetry mode is implemented");
 
+        if (src_Ax == nullptr) return; // Nothing to add
         if (isSparsityOnly()) setZero();
 
         auto addBlockColumn = [&](_Index bj) {
@@ -1237,14 +1240,14 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
 
             // Process all scalar columns overlapping block column bj.
             for (_Index cj = 0; cj < bsj; ++cj) {
-                const _Index j = bjo + cj;
-                _Index src_loc = src_Ap[j];
-                const _Index src_end = src_Ap[j + 1];
+                const SrcIdx j = bjo + cj;
+                SrcIdx src_loc = src_Ap[j];
+                const SrcIdx src_end = src_Ap[j + 1];
 
                 auto dst_cs = columnScanner(bj);
 
                 while (src_loc < src_end) {
-                    const _Index src_row = src_Ai[src_loc];
+                    const SrcIdx src_row = src_Ai[src_loc];
                     if (src_row == j) {
                         // Fast path for diagonal entries
                         assert(col_nnz(bj) > 0 && Ai[Ap[bj + 1] - 1] == bj && "Diagonal entry missing from destination sparsity pattern");
@@ -1266,6 +1269,14 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
         };
 
         parallel_for_range(n, addBlockColumn, /* grain_size = */ 50, /*parallelism_threshold = */ parallel ? 500 : std::numeric_limits<size_t>::max());
+    }
+
+    virtual void addWithSubSparsityScalarCSC(const ScalarCSCView &src, const _Real alpha = 1.0, bool parallel = true) override {
+        if ((src.rows != numScalarRows()) || (src.cols != numScalarCols()))
+            throw std::runtime_error("addWithSubSparsityScalarCSC: matrix dimensions do not match");
+        src.visit([&](const auto *src_Ap, const auto *src_Ai, const _Real *src_Ax) {
+            addWithSubSparsityScalarCSCImpl(src_Ap, src_Ai, src_Ax, alpha, parallel);
+        });
     }
 
     std::unique_ptr<BlockCSCHessianBase> clone() const override;

@@ -111,12 +111,13 @@ std::unique_ptr<BlockCSCHessianBase> compressFromScalar(const SuiteSparseMatrix 
     if (A.m != A.n) throw std::runtime_error("compressFromScalar: only square matrices supported");
     if (A.n % blockSize != 0) throw std::runtime_error("compressFromScalar: size must be divisible by blockSize");
     _Index numBlocks = A.n / blockSize;
+    ScalarCSCView scalarView = ScalarCSCView::from(A);
 
     if (blockSize == 2) result = BlockCSCHessian<OptimizationVarStructure<2>, ContiguousBlocks>::construct(OptimizationVarStructure<2>(numBlocks));
     if (blockSize == 3) result = BlockCSCHessian<OptimizationVarStructure<3>, ContiguousBlocks>::construct(OptimizationVarStructure<3>(numBlocks));
     if (!result) throw std::runtime_error("compressFromScalar: uninstantiated block size");
 
-    compress_sparsity_pattern(A.Ai.data(), A.Ap.data(), A.n, blockSize, blockAi, blockAp, /* keepUpperTriangleOnly = */ true);
+    compress_sparsity_pattern(scalarView, blockSize, blockAi, blockAp, /* keepUpperTriangleOnly = */ true);
 
     result->m = result->n = numBlocks;
     result->Ai = Eigen::Map<VecX_T<_Index>>(blockAi.data(), blockAi.size());
@@ -124,7 +125,7 @@ std::unique_ptr<BlockCSCHessianBase> compressFromScalar(const SuiteSparseMatrix 
     result->nz = result->Ai.size();
     result->finalize();
 
-    if (!A.isSparsityOnly()) result->addWithSubSparsityScalarCSC(A.Ap.data(), A.Ai.data(), A.Ax.data());
+    if (!A.isSparsityOnly()) result->addWithSubSparsityScalarCSC(scalarView);
 
     return result;
 }
