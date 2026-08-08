@@ -175,14 +175,14 @@ struct SparsityLRU {
 
         // if (maxAge > 0)
         //     std::cout << "Positive maxAge: " << maxAge << std::endl;
-        std::cout << "totalNewEntries: " << totalNewEntries << std::endl;
+        if (verbose) std::cout << "totalNewEntries: " << totalNewEntries << std::endl;
 
         // Semi-fast path: reuse (potentially pruned) cache if no new entries were added **and if the budget is not exceeded.**
         if (totalNewEntries == 0) {
             if (maxAge >= hardExpirationAge) {
                 pruneEntries([this](Index i) { return m_entryAge[i] >= expirationAge; });
                 m_maxAge = maxAgeBelowExpiration;
-                std::cout << "update: hard expiration triggered, maxAge = " << m_maxAge << std::endl;
+                if (verbose) std::cout << "update: hard expiration triggered, maxAge = " << m_maxAge << std::endl;
                 return EXPIRED;
             }
             m_maxAge = maxAge;
@@ -213,7 +213,7 @@ struct SparsityLRU {
                 totalNewEntries = EXPIRED;
             }
 
-            std::cout << "Number of old entries: " << numOldEntries << ", budget: " << budget << std::endl;
+            if (verbose) std::cout << "Number of old entries: " << numOldEntries << ", budget: " << budget << std::endl;
 
             for (Index i = 0; i < numOldEntries; ++i) {
                 const EntryLoc &loc = m_oldEntryLocations[i];
@@ -309,6 +309,7 @@ struct SparsityLRU {
     // Entries older than this are removed regardless of whether the budget is exceeded.
     int expirationAge = 25;
     int hardExpirationAge = 250; // Entries older than this trigger a rebuild.
+    bool verbose = true;
 
 private:
     SpMat m_S;

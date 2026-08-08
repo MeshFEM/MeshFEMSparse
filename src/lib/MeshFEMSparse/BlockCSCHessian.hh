@@ -31,6 +31,7 @@
 #include <MeshFEMSparse/VarStructure.hh>
 #include <MeshFEMSparse/ParallelAssembly.hh>
 #include <MeshFEMSparse/Utilities/ScalarCSCView.hh>
+#include <MeshFEMSparse/Utilities/compress_sparsity_pattern.hh>
 
 #include <Eigen/Sparse>
 
@@ -392,6 +393,16 @@ struct ColumnScanner<BCSCH, std::enable_if_t<BlockCSCHTraits<BCSCH>::VarStructur
         addBlockAtLoc(Ax, advanceToBlock(bi), block);
     }
 
+    template<class Block>
+    void addDiagonalBlock(double *Ax, const Block &block) const {
+        auto loc = diagBlockScalarLoc();
+        Index bs = colBlockSize();
+        for (size_t c = 0; c < bs; ++c) {
+            Eigen::Map<Eigen::VectorXd>(Ax + loc, c + 1) += block.col(c).topRows(c + 1);
+            loc += diagBlockColStride(c);
+        }
+    }
+
 private:
     const BCSCH &m_H;
     Index m_bj;
@@ -512,8 +523,18 @@ struct ColumnScanner<BCSCH, std::enable_if_t<!BlockCSCHTraits<BCSCH>::VarStructu
     template<class Block>
     void advanceToAndAddBlock(double *Ax, size_t bi, const Block &block) {
         // Find offset in `Ax` of the block's upper-left corner.
-        SuiteSparse_long loc = advanceToBlock(bi);
+        Index loc = advanceToBlock(bi);
         addBlockAtLoc(Ax, loc, block);
+    }
+
+    template<class Block>
+    void addDiagonalBlock(double *Ax, const Block &block) const {
+        auto loc = diagBlockScalarLoc();
+        Index bs = colBlockSize();
+        for (size_t c = 0; c < bs; ++c) {
+            Eigen::Map<Eigen::VectorXd>(Ax + loc, c + 1) += block.col(c).topRows(c + 1);
+            loc += diagBlockColStride(c);
+        }
     }
 
 private:
@@ -1400,6 +1421,35 @@ private:
     BlockCSCHessian(const VarStructure &varStructure)
         : BlockCSCHessianBase(varStructure.numBlocks(), varStructure.numBlocks()), m_vars(varStructure) { symmetry_mode = SymmetryMode::UPPER_TRIANGLE; }
 };
+
+template<bool ContiguousBlocks = ContiguousBlocksDefault>
+std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianFromScalar(const ScalarCSCView &A, int blockSize) {
+    using _Index = BlockCSCHessianBase::_Index;
+    std::unique_ptr<BlockCSCHessianBase> result;
+    if (A.rows != A.cols) throw std::runtime_error("compressFromScalar: only square matrices supported");
+    if (A.rows % blockSize != 0) throw std::runtime_error("compressFromScalar: size must be divisible by blockSize");
+
+    _Index numBlocks = A.rows / blockSize;
+    if (blockSize == 2) result = BlockCSCHessian<OptimizationVarStructure<2>, ContiguousBlocks>::construct(OptimizationVarStructure<2>(numBlocks));
+    if (blockSize == 3) result = BlockCSCHessian<OptimizationVarStructure<3>, ContiguousBlocks>::construct(OptimizationVarStructure<3>(numBlocks));
+    if (!result) throw std::runtime_error("compressFromScalar: uninstantiated block size");
+
+    std::vector<_Index> blockAi, blockAp;
+    compress_sparsity_pattern(A, blockSize, blockAi, blockAp, /* keepUpperTriangleOnly = */ true);
+
+    result->m = result->n = numBlocks;
+    result->Ai = Eigen::Map<VecX_T<_Index>>(blockAi.data(), blockAi.size());
+    result->Ap = std::move(blockAp);
+    result->nz = result->Ai.size();
+    result->finalize();
+
+    if (!A.isSparsityOnly()) result->addWithSubSparsityScalarCSC(A);
+
+    return result;
+}
+
+template<bool ContiguousBlocks = ContiguousBlocksDefault, class Mat>
+std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianFromScalar(const Mat &A, int blockSize) { return BlockCSCHessianFromScalar<ContiguousBlocks>(ScalarCSCView::from(A), blockSize); }
 
 } // namespace MeshFEM
 

@@ -133,6 +133,45 @@ struct ElementHessianContribAssembler<false> {
     }
 };
 
+struct ElementHessianContribAssemblerSupportingStencilDuplicates {
+    template<bool InParallel = true, class Real_, class SPMatBlock, class HeBlock, class ElemBlockVars, class VarStructure>
+    static void run(Real_ *Ax, const SPMatBlock &blockH, const HeBlock &He_block, const ElemBlockVars &blockVars, VarStructure &vars, VarLocks &varLocks) {
+        PerElementBlockOffsetCalculation<VarStructure, ElemBlockVars> blockOffsetCalc(vars, blockVars);
+
+        for (size_t lbj = 0; lbj < blockVars.size(); ++lbj) {
+            auto bj = blockVars[lbj];
+            const size_t lbo_j = blockOffsetCalc.offset(lbj);
+
+            auto colScanner = blockH.columnScanner(bj);
+            const size_t bs_j = colScanner.colBlockSize();
+            if constexpr (InParallel) varLocks.lock(bj);
+
+            for (size_t lbi = 0; lbi < blockVars.size(); ++lbi) {
+                auto bi = blockVars[lbi];
+                if (bi > bj) continue; // Skip lower triangle
+
+                const size_t lbo_i = blockOffsetCalc.offset(lbi);
+                const size_t bs_i  = blockOffsetCalc.blockSize(lbi);
+
+                if (bi == bj) {
+                    // Contributions to the diagonal blocks must happen here
+                    // within a loop since multiple contributions can end up
+                    // mapping to the same diagonal block due to duplicate
+                    // stencil indices.
+                    if (lbi < lbj) colScanner.addDiagonalBlock(Ax, He_block(lbo_i, lbo_j, bs_i, bs_j));
+                    else           colScanner.addDiagonalBlock(Ax, He_block(lbo_j, lbo_i, bs_i, bs_j).transpose());
+                    continue;
+                }
+
+                if (lbi < lbj) colScanner.addBlock(Ax, bi, He_block(lbo_i, lbo_j, bs_i, bs_j));
+                else           colScanner.addBlock(Ax, bi, He_block(lbo_j, lbo_i, bs_i, bs_j).transpose());
+            }
+
+            if constexpr (InParallel) varLocks.unlock(bj);
+        }
+    }
+};
+
 struct MESHFEM_EXPORT SystemAssemblerBase {
     using index_type = SuiteSparse_long;
     using CSCMat = CSCMatrix<index_type, double>;
@@ -535,10 +574,10 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
     // and therefore need to use dynamic-sized arrays for the element
     // contributions and stencils.
     // To minimize memory allocation overhead, we share these arrays across
-    // elements processed by the same thread. Also, in this case we expect the
-    // binary-search-based assembly algorithm to be faster than
-    // sort-and-merge due to the inability to use a fast static sort.
-    template<bool UseBlockMergeAlgorithm = false, class PEHEval, class ElementGetter>
+    // elements processed by the same thread.
+    // We do not make any assumptions in this routine that the stencil is unique
+    // (it may contain duplicates, which is needed e.g., for PolyFEM's PolySpline basis).
+    template<class PEHEval, class ElementGetter>
     void assembleHessianDynamicPEH(BlockCSCHessianBase &H_base, size_t numElements, const PEHEval &eval_He, const ElementGetter &element) const {
         auto &H = BCSCMat::cast(H_base);
         if (H.isSparsityOnly()) H.setZero(); // Allocate Ax array if necessary
@@ -559,7 +598,7 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
                 eval_He(ei, edata.H_e);
                 element(ei, edata.evars);
                 auto He_block = [&edata](size_t a, size_t b, size_t bsa, size_t bsb) { return edata.block(a, b, bsa, bsb); };
-                ElementHessianContribAssembler<UseBlockMergeAlgorithm>::template run</* InParallel = */ true>(Ax, H, He_block, edata.evars, m_vars, m_varLocks);
+                ElementHessianContribAssemblerSupportingStencilDuplicates::template run</* InParallel = */ true>(Ax, H, He_block, edata.evars, m_vars, m_varLocks);
             }, 1, 32);
         });
     }

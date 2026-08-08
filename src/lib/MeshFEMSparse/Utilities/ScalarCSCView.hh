@@ -27,6 +27,7 @@ struct ScalarCSCView {
     size_t cols = 0;
     size_t nnz = 0;
     IndexTypeEnum indexType = IndexTypeEnum::SuiteSparseLong;
+	bool isSparsityOnly() const { return Ax == nullptr; }
 
     static ScalarCSCView from(const SuiteSparseMatrix &A) {
         return ScalarCSCView{ A.Ap.data(), A.Ai.data(), A.Ax.data(), size_t(A.m), size_t(A.n), A.nnz(), IndexTypeEnum::SuiteSparseLong };
