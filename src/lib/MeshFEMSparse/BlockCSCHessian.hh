@@ -1430,6 +1430,7 @@ std::unique_ptr<BlockCSCHessianBase> BlockCSCHessianFromScalar(const ScalarCSCVi
     if (A.rows % blockSize != 0) throw std::runtime_error("compressFromScalar: size must be divisible by blockSize");
 
     _Index numBlocks = A.rows / blockSize;
+    if (blockSize == 1) result = BlockCSCHessian<OptimizationVarStructure<1>, ContiguousBlocks>::construct(OptimizationVarStructure<1>(numBlocks));
     if (blockSize == 2) result = BlockCSCHessian<OptimizationVarStructure<2>, ContiguousBlocks>::construct(OptimizationVarStructure<2>(numBlocks));
     if (blockSize == 3) result = BlockCSCHessian<OptimizationVarStructure<3>, ContiguousBlocks>::construct(OptimizationVarStructure<3>(numBlocks));
     if (!result) throw std::runtime_error("compressFromScalar: uninstantiated block size");
