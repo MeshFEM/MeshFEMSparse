@@ -859,11 +859,18 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
 
     // Call f(j, loc), passing the location in `Ax` of the diagonal entry
     // in scalar column j, for each j in 0..numScalarVars() - 1
+    // Note: empty block columns are skipped. Their diagonal entries are not
+    // stored (so there is no location to hand to `f`), and
+    // `diagBlockScalarLoc()` would compute an offset into the preceding
+    // column's storage for them. `j` still advances so callers see the correct
+    // scalar column indices. Callers that must touch every diagonal entry
+    // should call `assertAllDiagonalBlocksPresent` first.
     template<class F>
     void visitDiagonalScalarEntries(F &&f) const {
         _Index j = 0;
         for (_Index bj = 0; bj < n; ++bj) {
             auto cs = columnScanner(bj);
+            if (col_nnz(bj) == 0) { j += cs.colBlockSize(); continue; }
             _Index loc = cs.diagBlockScalarLoc();
             for (_Index c_j = 0; c_j < cs.colBlockSize(); ++c_j) {
                 f(j++, loc);
@@ -871,6 +878,14 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
                     +  1;                         // and down one to reach the diagonal
             }
         }
+    }
+
+    // Throw unless every block column has a diagonal block, which the
+    // diagonal-mutating operations below require: for a column without one
+    // there is no stored entry to write.
+    void assertAllDiagonalBlocksPresent(const char *op) const {
+        if (numDiagonalBlocks() < size_t(n))
+            throw std::runtime_error(std::string("BlockCSCHessian::") + op + ": matrix is missing diagonal blocks; insert them first (see BorderedSparseHessian::insertSparsityPatternDiagonalBlocksIfNeeded)");
     }
 
     virtual Real trace() const override {
@@ -1407,14 +1422,17 @@ private:
     VarStructure m_vars;
 
     virtual void m_addDiag(const _Real *d) override {
+        assertAllDiagonalBlocksPresent("addDiag");
         visitDiagonalScalarEntries([d, this](size_t j, _Index loc) { Ax[loc] += d[j]; });
     }
 
     virtual void m_addDiag(_Real d) override {
+        assertAllDiagonalBlocksPresent("addDiag");
         visitDiagonalScalarEntries([d, this](size_t /* j */, _Index loc) { Ax[loc] += d; });
     }
 
     virtual void m_setDiag(_Real d) override {
+        assertAllDiagonalBlocksPresent("setDiag");
         visitDiagonalScalarEntries([d, this](size_t /* j */, _Index loc) { Ax[loc] = d; });
     }
 
