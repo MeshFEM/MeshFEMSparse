@@ -34,6 +34,7 @@
 #include <MeshFEMSparse/Utilities/compress_sparsity_pattern.hh>
 
 #include <Eigen/Sparse>
+#include <functional>
 
 #include <istream>
 #include <memory>
@@ -616,6 +617,22 @@ struct MESHFEM_EXPORT BlockCSCHessianBase : public SuiteSparseMatrix {
     virtual size_t scalarNNZ() const = 0;
     virtual Real trace()       const = 0;
 
+    // Call f(j, loc), passing the location in `Ax` of the diagonal entry
+    // in scalar column j, for each j in 0..numScalarVars() - 1
+    // Due to the use of `std::function`, this virtual method has
+    // significant overhead compared to the underlying method template
+    // `BlockCSCHessian::visitDiagonalScalarEntries`, which should be preferred
+    // in contexts where the concrete type of the `BlockCSCHessian` is known.
+    //
+    // WARNING: empty block columns are silently skipped, but otherwise
+    // no checks are performed to ensure that the diagonal blocks are present.
+    // If a diagonal block is missing, the locations passed for the
+    // corresponding scalar columns will be invalid.
+    // It is the user's responsibility to verify
+    // `numDiagonalBlocks`/`assertAllDiagonalBlocksPresent` before calling this
+    // method.
+    virtual void visitDiagonalScalarEntries(const std::function<void(size_t, _Index)> &f) const = 0;
+
     // Set each nonzero entry to a particular value, preserving the sparsity pattern.
     void fill(double val) { Ax.assign(scalarNNZ(), val); }
     void setZero() {
@@ -859,12 +876,8 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
 
     // Call f(j, loc), passing the location in `Ax` of the diagonal entry
     // in scalar column j, for each j in 0..numScalarVars() - 1
-    // Note: empty block columns are skipped. Their diagonal entries are not
-    // stored (so there is no location to hand to `f`), and
-    // `diagBlockScalarLoc()` would compute an offset into the preceding
-    // column's storage for them. `j` still advances so callers see the correct
-    // scalar column indices. Callers that must touch every diagonal entry
-    // should call `assertAllDiagonalBlocksPresent` first.
+    // See warnings and notes in the base class above.
+    virtual void visitDiagonalScalarEntries(const std::function<void(size_t, _Index)> &f) const override { visitDiagonalScalarEntries([&f](size_t j, _Index loc) { f(j, loc); }); }
     template<class F>
     void visitDiagonalScalarEntries(F &&f) const {
         _Index j = 0;
