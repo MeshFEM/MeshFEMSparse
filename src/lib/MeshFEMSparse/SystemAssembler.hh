@@ -15,6 +15,7 @@
 #include <atomic>
 #include <tuple>
 #include <functional>
+#include <cassert>
 #include <tbb/enumerable_thread_specific.h>
 #include <MeshFEMSparse/SparseMatrices.hh>
 #include <MeshFEMSparse/Utilities/argsort.hh>
@@ -265,11 +266,14 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
                 auto bvars = blockVarsForElement(ei);
 #if 1
                 static_sort_with_fallback(bvars);
-                for (decltype(bvars.size()) i = 0; i < bvars.size(); ++i)
+                for (decltype(bvars.size()) i = 0; i < bvars.size(); ++i) {
+                    assert(size_t(bvars[i]) < n && "Stencil index exceeds the number of block variables specified to the SystemAssembler constructor.");
                     sizes[bvars[i]] += (i + 1);
+                }
 #else
                 for (decltype(bvars.size()) v_b_i = 0; v_b_i < bvars.size(); ++v_b_i) {
                     auto v_b = bvars[v_b_i];
+                    assert(size_t(bvars[i]) < n && "Stencil index exceeds the number of block variables specified to the SystemAssembler constructor.");
                     for (decltype(bvars.size()) v_a_i = 0; v_a_i < bvars.size(); ++v_a_i)
                         if (bvars[v_a_i] <= v_b) ++sizes[v_b]; // sizes[v_b] += (v_a <= v_b);
                 }
