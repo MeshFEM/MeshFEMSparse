@@ -1163,7 +1163,7 @@ struct MESHFEM_EXPORT BlockCSCHessian final : public BlockToScalarPolicyDefault<
 
     // Offset of local entry (c_i, c_j) of the block at (bi, bj)
     // relative to the upper-left entry located at `locForBlock(bi, bj)`.
-    _Index intrablockOffset(size_t bi, size_t bj, size_t c_i, size_t c_j) const {
+    _Index intrablockOffset(size_t bi [[maybe_unused]], size_t bj [[maybe_unused]], size_t c_i, size_t c_j) const {
         if constexpr (ContiguousBlocks) {
             static_assert(StoreFullDiagonalBlocks, "Only StoreFullDiagonalBlocks case is supported");
             size_t bsi = m_vars.blockSize(bi);

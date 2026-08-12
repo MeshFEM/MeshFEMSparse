@@ -118,6 +118,8 @@ private:
 #endif
                 break;
             }
+            default:
+                throw std::runtime_error("cholmod_ordering: unrecognized method");
         }
 
         return iperm;
@@ -156,6 +158,8 @@ private:
 #endif
                 break;
             }
+            default:
+                throw std::runtime_error("cholmod_ordering: unrecognized method");
         }
 
         return iperm;

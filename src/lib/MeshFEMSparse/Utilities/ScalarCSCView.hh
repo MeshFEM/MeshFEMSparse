@@ -47,8 +47,9 @@ struct ScalarCSCView {
             case IndexTypeEnum::SuiteSparseLong:
                 std::forward<F>(f)(static_cast<const SuiteSparse_long *>(Ap), static_cast<const SuiteSparse_long *>(Ai), Ax);
                 return;
+            default:
+                throw std::runtime_error("ScalarCSCView: unsupported index type");
         }
-        throw std::runtime_error("ScalarCSCView: unsupported index type");
     }
 };
 
