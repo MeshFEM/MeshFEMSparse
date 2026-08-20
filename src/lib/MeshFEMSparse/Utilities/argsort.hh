@@ -15,12 +15,13 @@
 
 namespace MeshFEM {
 
-template<typename T, size_t Size>
-static auto argsort(const std::array<T, Size> &blockVars) { // For static element sizes
+template<bool Descending = false, typename T, size_t Size>
+static auto argsort(const std::array<T, Size> &values) { // For static element sizes
     std::array<size_t, Size> order;
     for (size_t i = 0; i < Size; ++i) { order[i] = i; }
     StaticTimSort<Size> timBoseNelsonSort;
-    timBoseNelsonSort(order, [&blockVars](size_t a, size_t b) { return blockVars[a] < blockVars[b]; });
+    if constexpr (Descending) timBoseNelsonSort(order, [&values](size_t a, size_t b) { return values[a] > values[b]; });
+    else                      timBoseNelsonSort(order, [&values](size_t a, size_t b) { return values[a] < values[b]; });
     return order;
 }
 
