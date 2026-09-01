@@ -127,8 +127,8 @@ struct MESHFEM_EXPORT BorderedSparseHessian {
 
     BorderedSparseHessian(BorderedSparseHessian &&other) noexcept { swap(*this, other); }
 
-    static std::unique_ptr<BorderedSparseHessian> fromSuiteSparse(const SuiteSparseMatrix &H_ss_) {
-        return std::make_unique<BorderedSparseHessian>(BlockCSCHessianBase::fromScalar(H_ss_));
+    static std::unique_ptr<BorderedSparseHessian> fromSuiteSparse(const SuiteSparseMatrix &H_ss_, int blockSize = 1) {
+        return std::make_unique<BorderedSparseHessian>(BlockCSCHessianBase::fromScalar(H_ss_, blockSize));
     }
 
     // TODO FIXME: when H_ss isn't present, we don't have a varStructure to know the dense size!
@@ -371,6 +371,8 @@ private:
 struct MESHFEM_EXPORT BorderedSparseFactorization {
     BorderedSparseFactorization(const BorderedSparseHessian &H, const std::vector<size_t> &fixedVars = std::vector<size_t>(),
                                 CholeskyProvider factorizer = get_default_cholesky_provider());
+
+    void updateNumericFactorization(const BorderedSparseHessian &H);
 
     void solve(const Eigen::VectorXd &b, Eigen::VectorXd &x) const;
 

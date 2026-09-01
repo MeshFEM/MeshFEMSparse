@@ -8,7 +8,16 @@ BorderedSparseFactorization::BorderedSparseFactorization(const BorderedSparseHes
     m_lowRankRank = H.low_rank_rank();
     m_setFixedVars(fixedVars);
     m_solver = make_cholesky_factorizer(factorizer);
-    m_solver->factorize(*(H.H_ss), sparseFixedVars());
+    if (m_sparseDenseStructure.numSparseVars > 0)
+        m_solver->factorizeSymbolic(*(H.H_ss), sparseFixedVars());
+
+    updateNumericFactorization(H);
+}
+
+void BorderedSparseFactorization::updateNumericFactorization(const BorderedSparseHessian &H) {
+    H.validate();
+    if (m_sparseDenseStructure.numSparseVars > 0)
+        m_solver->factorizeNumeric(*(H.H_ss));
     m_updateDenseFactorization(H);
 }
 
