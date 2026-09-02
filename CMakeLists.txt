@@ -96,7 +96,7 @@ target_link_libraries(MeshFEMSparse
         warnings::all
 )
 
-target_compile_options(MeshFEMSparse PUBLIC -fvisibility=hidden)
+meshfem_apply_abi_flags(MeshFEMSparse)
 
 if(MESHFEM_NO_GPL)
     target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_NO_GPL)

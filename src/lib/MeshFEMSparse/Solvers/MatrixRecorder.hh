@@ -105,7 +105,7 @@ protected:
     bool m_recordOnlyMostRecentMatrix = false;
 };
 
-MESHFEM_EXPORT extern MatrixRecorder g_matrixRecorder;
+MESHFEM_EXPORT_DATA extern MatrixRecorder g_matrixRecorder;
 
 } // namespace MeshFEM
 
