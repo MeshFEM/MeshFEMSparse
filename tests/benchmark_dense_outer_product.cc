@@ -113,27 +113,27 @@ void runBenchmarkForType(int height, int rank, int tileSize, size_t numTrials) {
 
     validate(A, C0, C_ref, "TBBLowerNormalHermitianOuterProduct", tbbOuterProduct);
     std::cout << (std::is_same<Real, float>::value ? "float" : "double") << ','
-              << height << ',' << rank << ",TBBLowerNormalHermitianOuterProduct,"
+              << height << ',' << rank << ",TBBLowerNormalHermitianOuterProduct_" << tileSize << ","
               << std::setprecision(16) << timeUpdate(C0, numTrials, tbbOuterProduct) << std::endl;
 
     std::cout << (std::is_same<Real, float>::value ? "float" : "double") << ','
               << height << ',' << rank << ",BLAS_syrk,"
               << std::setprecision(16) << timeUpdate(C0, numTrials, syrk) << std::endl;
 
-    if constexpr (std::is_same<Real, float>::value) {
-        static const bool mpsAvailable = mpsOuterProductAvailable();
-        if (mpsAvailable) {
-            auto mps = [&](MatrixX<Real> &C) {
-                return mpsLowerNormalHermitianOuterProduct(alpha, A.data(), height, rank, beta, C.data());
-            };
-            validate(A, C0, C_ref, "MPS", mps);
-            std::cout << "float," << height << ',' << rank << ",MPS,"
-                      << std::setprecision(16) << timeRawUpdate(C0, numTrials, mps) << std::endl;
-        }
-        else {
-            std::cerr << "MPS outer product unavailable; skipping MPS timings" << std::endl;
-        }
-    }
+    // if constexpr (std::is_same<Real, float>::value) {
+    //     static const bool mpsAvailable = mpsOuterProductAvailable();
+    //     if (mpsAvailable) {
+    //         auto mps = [&](MatrixX<Real> &C) {
+    //             return mpsLowerNormalHermitianOuterProduct(alpha, A.data(), height, rank, beta, C.data());
+    //         };
+    //         validate(A, C0, C_ref, "MPS", mps);
+    //         std::cout << "float," << height << ',' << rank << ",MPS,"
+    //                   << std::setprecision(16) << timeRawUpdate(C0, numTrials, mps) << std::endl;
+    //     }
+    //     else {
+    //         std::cerr << "MPS outer product unavailable; skipping MPS timings" << std::endl;
+    //     }
+    // }
 }
 
 int main(int argc, const char *argv[]) {
@@ -152,13 +152,13 @@ int main(int argc, const char *argv[]) {
         throw std::runtime_error("height, rank, and tile_size must be positive");
 
     set_max_num_tbb_threads(numThreads);
-    printMPSOuterProductDeviceInfo(std::cerr);
+    // printMPSOuterProductDeviceInfo(std::cerr);
 
 #if __linux__
     PinningObserver thread_pinner;
 #endif
 
-    std::cout << "scalar,height,rank,method,time" << std::endl;
+    std::cout << "# scalar,height,rank,method,time" << std::endl;
     runBenchmarkForType<float >(height, rank, tileSize, numTrials);
     runBenchmarkForType<double>(height, rank, tileSize, numTrials);
     return 0;
