@@ -18,17 +18,20 @@ endif()
 add_executable(solve_system solve_system.cc)
 target_link_libraries(solve_system MeshFEMSparse)
 
-add_executable(benchmark_linear_systems benchmark_linear_systems.cc)
-target_link_libraries(benchmark_linear_systems MeshFEMSparse)
-
 add_executable(benchmark_sparsity_lru benchmark_sparsity_lru.cc)
 target_link_libraries(benchmark_sparsity_lru MeshFEMSparse)
 
 add_executable(benchmark_solves benchmark_solves.cc)
 target_link_libraries(benchmark_solves MeshFEMSparse)
 
-add_executable(benchmark_sorts benchmark_sorts.cc)
-target_link_libraries(benchmark_sorts MeshFEMSparse)
+# These two use <glob.h> and GCC inline assembly respectively.
+if (NOT MSVC)
+    add_executable(benchmark_linear_systems benchmark_linear_systems.cc)
+    target_link_libraries(benchmark_linear_systems MeshFEMSparse)
+
+    add_executable(benchmark_sorts benchmark_sorts.cc)
+    target_link_libraries(benchmark_sorts MeshFEMSparse)
+endif()
 
 if (MESHFEM_WITH_CATAMARI AND NOT MESHFEM_USE_LEGACY_CATAMARI)
     add_executable(benchmark_dense_linalg benchmark_dense_linalg.cc)
@@ -74,6 +77,15 @@ endif()
 if (MESHFEM_WITH_SCOTCH)
     add_executable(benchmark_scotch benchmark_scotch.cc)
     target_link_libraries(benchmark_scotch MeshFEMSparse)
+endif()
+
+# These executables link the static MeshFEMSparse rather than MeshFEM.dll, so the
+# export annotations must expand to nothing rather than to __declspec(dllimport).
+if (MSVC)
+    foreach (meshfem_sparse_test_target
+             MeshFEMSparse_unit_tests solve_system benchmark_sparsity_lru benchmark_solves)
+        target_compile_definitions(${meshfem_sparse_test_target} PRIVATE MESHFEM_STATIC_DEFINE)
+    endforeach()
 endif()
 
 include(Catch)

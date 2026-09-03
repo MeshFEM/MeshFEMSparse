@@ -874,7 +874,7 @@ struct CSCMatrix {
     // just a std::vector<_Real>, so the values will actually be initialized to
     // zero).
     CSCMatrix(_Index mm, _Index nn, const IdxVector &Ap_in, const IdxVector &Ai_in)
-        : Ap(Ap_in), Ai(Ai_in), Ax(Ai.size()), m(mm), n(nn), nz(Ai_in.size()) { }
+        : Ap(Ap_in), Ai(Eigen::Map<const VecX_T<RowIndex>>(Ai_in.data(), Ai_in.size())), Ax(Ai.size()), m(mm), n(nn), nz(Ai_in.size()) { }
 
     CSCMatrix(const CSCMatrix  &b, bool sparsityOnly=false) : Ap(b.Ap), Ai(b.Ai), m(b.m), n(b.n), nz(b.nz), symmetry_mode(b.symmetry_mode) { if (!sparsityOnly) Ax = b.Ax; }
     CSCMatrix(      CSCMatrix &&b) noexcept : Ap(std::move(b.Ap)), Ai(std::move(b.Ai)), Ax(std::move(b.Ax)), m(b.m), n(b.n), nz(b.nz), symmetry_mode(b.symmetry_mode) { }

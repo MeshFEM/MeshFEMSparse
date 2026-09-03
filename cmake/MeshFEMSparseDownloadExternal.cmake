@@ -13,12 +13,15 @@ endfunction()
 
 ## Catamari
 # TODO: change these to pinned tags and https once public.
+set(CATAMARI_GIT_REPOSITORY "https://github.com/MeshFEM/BlockCatamari.git" CACHE STRING "BlockCatamari git repository")
+set(CATAMARI_GIT_TAG "master" CACHE STRING "BlockCatamari git revision")
+
 function(meshfem_download_catamari)
     meshfem_prepare_editable_repo(catamari
-        "${MESHFEM_EXTERNAL}/catamari" master)
+        "${MESHFEM_EXTERNAL}/catamari" "${CATAMARI_GIT_TAG}")
     FetchContent_Declare(catamari
-        GIT_REPOSITORY https://github.com/MeshFEM/BlockCatamari.git
-        GIT_TAG        master
+        GIT_REPOSITORY ${CATAMARI_GIT_REPOSITORY}
+        GIT_TAG        ${CATAMARI_GIT_TAG}
         SOURCE_DIR     ${MESHFEM_EXTERNAL}/catamari
     )
     FetchContent_MakeAvailable(catamari)
