@@ -9,6 +9,7 @@
 #include <type_traits>
 
 #if MESHFEM_WITH_CHOLMOD
+#include "ParallelNestedDissection/cholmod_nesdis_parallel.hh"
 extern "C" {
 #include <cholmod.h>
 }
@@ -18,7 +19,7 @@ namespace MeshFEM {
 
 class CholmodOrdering {
 public:
-    enum class Method { AMD, NestedDissection, Metis };
+    enum class Method { AMD, NestedDissection, ParallelNestedDissection, Metis };
 
     ~CholmodOrdering() {
 #if MESHFEM_WITH_CHOLMOD
@@ -45,10 +46,19 @@ private:
 #if MESHFEM_WITH_CHOLMOD
     std::unique_ptr<cholmod_common> m_c, m_c_int;
 
+    void configure_common(cholmod_common *c) {
+        // c->method[0].nd_compress = false;
+        // c->method[0].nd_compress = false;
+        // c->method[0].nd_small = 50;
+        // c->method[0].nd_camd = 0;
+        // c->method[0].prune_dense = -1;
+    }
+
     cholmod_common *commonLong() {
         if (!m_c) {
             m_c = std::make_unique<cholmod_common>();
             cholmod_l_start(m_c.get());
+            configure_common(m_c.get());
         }
         return m_c.get();
     }
@@ -57,6 +67,7 @@ private:
         if (!m_c_int) {
             m_c_int = std::make_unique<cholmod_common>();
             cholmod_start(m_c_int.get());
+            configure_common(m_c_int.get());
         }
         return m_c_int.get();
     }
@@ -108,6 +119,17 @@ private:
 #endif
                 break;
             }
+            case Method::ParallelNestedDissection: {
+#ifdef NPARTITION
+                throwPartitionUnavailable();
+#else
+                BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_l_nested_dissection_parallel");
+                VecX_T<SuiteSparse_long> CParent(A.m), CMember(A.m);
+                cholmod_l_nested_dissection_parallel(&cholmat, /* fset = */ nullptr, /* fsize = */ 0,
+                                                     iperm.data(), CParent.data(), CMember.data(), commonLong());
+#endif
+                break;
+            }
             case Method::Metis: {
 #ifdef NPARTITION
                 throwPartitionUnavailable();
@@ -145,6 +167,17 @@ private:
                 VecX_T<int> CParent(A.m), CMember(A.m);
                 cholmod_nested_dissection(&cholmat, /* fset = */ nullptr, /* fsize = */ 0,
                                           iperm.data(), CParent.data(), CMember.data(), commonInt());
+#endif
+                break;
+            }
+            case Method::ParallelNestedDissection: {
+#ifdef NPARTITION
+                throwPartitionUnavailable();
+#else
+                BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_nested_dissection_parallel");
+                VecX_T<int> CParent(A.m), CMember(A.m);
+                cholmod_nested_dissection_parallel(&cholmat, /* fset = */ nullptr, /* fsize = */ 0,
+                                                  iperm.data(), CParent.data(), CMember.data(), commonInt());
 #endif
                 break;
             }

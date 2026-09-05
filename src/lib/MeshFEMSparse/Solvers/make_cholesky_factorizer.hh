@@ -19,7 +19,7 @@ inline CholeskyProvider get_default_cholesky_provider(CholeskyProviderHint hint 
 #if MESHFEM_WITH_CATAMARI
 #if MESHFEM_WITH_CHOLMOD
     if (hint == CholeskyProviderHint::CheapSymbolic) return CholeskyProvider::CatamariAMD;
-    if (hint == CholeskyProviderHint::CheapNumeric)  return CholeskyProvider::CatamariNesdis;
+    if (hint == CholeskyProviderHint::CheapNumeric)  return CholeskyProvider::CatamariNesdisParallel;
     return CholeskyProvider::CatamariAdaptive;
 #else
 	return CholeskyProvider::Catamari;

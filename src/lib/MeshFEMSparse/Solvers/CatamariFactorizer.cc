@@ -176,7 +176,8 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
 
     if (orderingMethod == OrderingMethod::Catamari)
         m_ldl->Factor(m_catamariConverter->get(), *m_ldlControl, /* symbolic_only = */ true);
-    else if ((orderingMethod == OrderingMethod::CholmodNesdis) || (orderingMethod == OrderingMethod::Metis)
+    else if ((orderingMethod == OrderingMethod::CholmodNesdis) || (orderingMethod == OrderingMethod::CholmodNesdisParallel)
+          || (orderingMethod == OrderingMethod::Metis)
           || (orderingMethod == OrderingMethod::AMD) || (orderingMethod == OrderingMethod::Adaptive)) {
         OrderingMethod actualOrderingMethod = orderingMethod;
         if (orderingMethod == OrderingMethod::Adaptive) {
@@ -196,6 +197,11 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
 
             if (actualOrderingMethod == OrderingMethod::CholmodNesdis) {
                 auto iperm = m_cholmodOrdering.inversePermutation<catamari::Int>(*A_reduced, CholmodOrdering::Method::NestedDissection);
+                Eigen::Map<VecX_T<catamari::Int>>(ordering.inverse_permutation.Data(), A_reduced->m) = iperm;
+                quotient::InvertPermutation(ordering.inverse_permutation, &ordering.permutation);
+            }
+            else if (actualOrderingMethod == OrderingMethod::CholmodNesdisParallel) {
+                auto iperm = m_cholmodOrdering.inversePermutation<catamari::Int>(*A_reduced, CholmodOrdering::Method::ParallelNestedDissection);
                 Eigen::Map<VecX_T<catamari::Int>>(ordering.inverse_permutation.Data(), A_reduced->m) = iperm;
                 quotient::InvertPermutation(ordering.inverse_permutation, &ordering.permutation);
             }

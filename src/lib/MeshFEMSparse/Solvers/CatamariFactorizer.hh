@@ -32,7 +32,7 @@ struct CatamariConverter;
 
 struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
     enum class OrderingMethod {
-        Catamari, CholmodNesdis, Metis, AMD, Adaptive, Scotch, AccelerateMetis, PardisoMetis, PardisoParallelMetis
+        Catamari, CholmodNesdis, CholmodNesdisParallel, Metis, AMD, Adaptive, Scotch, AccelerateMetis, PardisoMetis, PardisoParallelMetis
     };
 
     // legacy: whether to use Jack Poulson's original implementation for comparison
@@ -108,6 +108,7 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
 
         if (orderingMethod == OrderingMethod::Catamari)           return CholeskyProvider::Catamari;
         else if (orderingMethod == OrderingMethod::CholmodNesdis) return CholeskyProvider::CatamariNesdis;
+        else if (orderingMethod == OrderingMethod::CholmodNesdisParallel) return CholeskyProvider::CatamariNesdisParallel;
         else if (orderingMethod == OrderingMethod::AMD)           return CholeskyProvider::CatamariAMD;
         else if (orderingMethod == OrderingMethod::Adaptive)      return CholeskyProvider::CatamariAdaptive;
         else if (orderingMethod == OrderingMethod::Scotch)        return CholeskyProvider::CatamariScotch;
@@ -120,13 +121,13 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
 
     OrderingMethod orderingMethod =
 #if MESHFEM_WITH_CHOLMOD
-        OrderingMethod::CholmodNesdis;
+        OrderingMethod::CholmodNesdisParallel;
 #else
         OrderingMethod::Catamari;
 #endif
 
     struct OrderingChoices {
-        static constexpr OrderingMethod   primary_method = OrderingMethod::CholmodNesdis;
+        static constexpr OrderingMethod   primary_method = OrderingMethod::CholmodNesdisParallel;
         static constexpr OrderingMethod alternate_method = OrderingMethod::AMD;
 
         // Default multipliers for the factorization time of one method relative to the other (used when reliable data is not available).

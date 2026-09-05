@@ -16,7 +16,7 @@
 namespace MeshFEM {
 
 enum class CholeskyProvider {
-    CHOLMOD, Catamari, CatamariNesdis, CatamariMetis, CatamariLegacy, CatamariAMD, CatamariScotch, CatamariAdaptive, PARDISO, Accelerate
+    CHOLMOD, Catamari, CatamariNesdis, CatamariNesdisParallel, CatamariMetis, CatamariLegacy, CatamariAMD, CatamariScotch, CatamariAdaptive, PARDISO, Accelerate
 };
 
 // Eigen provides a `swap` method rather than overloading `std::swap`

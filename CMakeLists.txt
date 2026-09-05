@@ -109,6 +109,9 @@ endif()
 
 if(MESHFEM_WITH_CHOLMOD)
     target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_CHOLMOD)
+    target_sources(MeshFEMSparse PRIVATE
+        src/lib/MeshFEMSparse/Solvers/ParallelNestedDissection/cholmod_nesdis_parallel.cc
+    )
     target_link_libraries(MeshFEMSparse PUBLIC cholmod::cholmod)
 endif()
 
