@@ -26,4 +26,17 @@ extern "C" int64_t cholmod_l_nested_dissection_parallel(
     int64_t *Cmember,
     cholmod_common *Common);
 
+namespace MeshFEM::CholmodParallelNesdis {
+
+// Order an already-expanded symmetric graph, not graph * graph'. Input must be
+// valid, square, sorted, packed CSC with stype == 0 and matching Int indices.
+// Both triangles must be present; diagonal entries are optional. The input is
+// borrowed read-only throughout the call; discovery uses a private index copy.
+// Explicitly instantiated for int32_t and int64_t. Outputs follow the C API above.
+template<class Int>
+int64_t nested_dissection_from_graph(const cholmod_sparse &graph,
+    Int *Perm, Int *CParent, Int *Cmember, cholmod_common *Common);
+
+} // namespace MeshFEM::CholmodParallelNesdis
+
 #endif /* MESHFEMSPARSE_CHOLMOD_NESDIS_PARALLEL_HH */

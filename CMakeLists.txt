@@ -111,6 +111,8 @@ if(MESHFEM_WITH_CHOLMOD)
     target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_CHOLMOD)
     target_sources(MeshFEMSparse PRIVATE
         src/lib/MeshFEMSparse/Solvers/ParallelNestedDissection/cholmod_nesdis_parallel.cc
+        src/lib/MeshFEMSparse/Solvers/ParallelNestedDissection/hierarchical_camd.cc
+        src/lib/MeshFEMSparse/Solvers/ParallelNestedDissection/nesdis_bisector.cc
     )
     target_link_libraries(MeshFEMSparse PUBLIC cholmod::cholmod)
 endif()
@@ -125,7 +127,7 @@ endif()
 
 if (MESHFEM_WITH_SCOTCH)
     target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_SCOTCH)
-    target_link_libraries(MeshFEMSparse PUBLIC SCOTCH::scotch SCOTCH::scotcherrexit)
+    target_link_libraries(MeshFEMSparse PUBLIC SCOTCH::scotch SCOTCH::scotcherr)
 endif()
 
 if (MESHFEM_WITH_MKL_PARDISO)

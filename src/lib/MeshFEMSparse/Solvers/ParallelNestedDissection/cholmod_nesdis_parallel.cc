@@ -1,15 +1,24 @@
+#include "hierarchical_camd.hh"
+#include "cholmod_nesdis_parallel.hh"
+#include "nesdis_bisector.hh"
+#include "nesdis_options.hh"
 #include "cholmod_internal_excerpts.hh"
 
+#include <algorithm>
+#include <chrono>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include <tbb/enumerable_thread_specific.h>
 #include <tbb/global_control.h>
+#include <tbb/parallel_for.h>
+#include <tbb/parallel_invoke.h>
+#include <tbb/task_arena.h>
 #include <tbb/task_group.h>
-
-#define CHOLMOD_NESDIS_USE_THREADS 1
 
 namespace MeshFEM::CholmodParallelNesdis {
 
@@ -31,6 +40,8 @@ struct nesdis_failure {
 template<class Int>
 struct nesdis_local {
     nesdis_local(Int n_, Int csize_, cholmod_common *Common_);
+    nesdis_local(const nesdis_local &) = delete;
+    nesdis_local &operator=(const nesdis_local &) = delete;
     ~nesdis_local() { release (); }
 
     void release () ;
@@ -40,9 +51,6 @@ struct nesdis_local {
     cholmod_sparse *C ;
 
     Int *Imap ;
-    Int *Map ;
-    Int *Mark ;
-    Int mark ;
     Int *Hash ;
     Int *Cmap ;
     Int *Cp ;
@@ -58,6 +66,8 @@ struct nesdis_local {
 
 template<class Int>
 struct nesdis_shared {
+    explicit nesdis_shared(const NesdisOptions &options) : Bisector(options) { }
+    NesdisBisector Bisector;
     Int n ;
     Int csize ;
     Int nd_compress ;
@@ -74,11 +84,10 @@ struct nesdis_shared {
 
     tbb::task_group TaskGroup ;
     cholmod_common *Common ;
-#ifdef CHOLMOD_NESDIS_USE_THREADS
-    int UseParallel ;
-    int MaxParallelDepth ;
+    bool UseParallel = false;
+    int MaxParallelDepth = 0;
+    Int SerialSubtreeSize;
     tbb::enumerable_thread_specific<std::unique_ptr<nesdis_local<Int>>> LocalWorkspaces ;
-#endif
 };
 
 template<class Int>
@@ -101,8 +110,9 @@ inline nesdis_local<Int>::nesdis_local
 
     C = CholmodApi<Int>::allocate_sparse (n, n, csize, FALSE, TRUE, 0,
             CHOLMOD_PATTERN, Common) ;
-    Cew  = (Int *) CholmodApi<Int>::malloc (csize, sizeof (Int), Common) ;
-    WorkLocal = (Int *) CholmodApi<Int>::malloc (n, 7*sizeof (Int), Common) ;
+    if (Common->method [Common->current].nd_compress)
+        Cew = (Int *) CholmodApi<Int>::malloc (csize, sizeof (Int), Common) ;
+    WorkLocal = (Int *) CholmodApi<Int>::malloc (n, 5*sizeof (Int), Common) ;
 
     if (Common->status < CHOLMOD_OK)
     {
@@ -113,20 +123,12 @@ inline nesdis_local<Int>::nesdis_local
 
     Part = WorkLocal ;
     Cnw  = Part + n ;
-    Mark = Cnw + n ;
-    Map  = Mark + n ;
-    Imap = Map + n ;
+    Imap = Cnw + n ;
     Hash = Imap + n ;
     Cmap = Hash + n ;
     Cp = (Int *) C->p ;
     Ci = (Int *) C->i ;
-    mark = 0 ;
-
-    for (j = 0 ; j < n ; j++)
-    {
-        Mark [j] = EMPTY ;
-    }
-    for (j = 0 ; j < csize ; j++)
+    if (Cew) for (j = 0 ; j < csize ; j++)
     {
         Cew [j] = 1 ;
     }
@@ -148,13 +150,11 @@ inline void nesdis_local<Int>::release
         CholmodApi<Int>::free_sparse (&C, Common) ;
     }
     CholmodApi<Int>::free (csize, sizeof (Int), Cew, Common) ;
-    CholmodApi<Int>::free (7*n, sizeof (Int), WorkLocal, Common) ;
+    CholmodApi<Int>::free (5*n, sizeof (Int), WorkLocal, Common) ;
     Cew = NULL ;
     WorkLocal = NULL ;
     Part = NULL ;
     Cnw = NULL ;
-    Mark = NULL ;
-    Map = NULL ;
     Imap = NULL ;
     Hash = NULL ;
     Cmap = NULL ;
@@ -163,131 +163,176 @@ inline void nesdis_local<Int>::release
 }
 
 //------------------------------------------------------------------------------
-// nesdis threaded helpers
+// Component discovery and traversal order
 //------------------------------------------------------------------------------
 
 template<class Int>
-static void nesdis_process_recursive
-(
-    nesdis_shared<Int> *S,
-    nesdis_local<Int> *L,
-    Int Cstack [ ],
-    Int *top,
-    Int depth
-);
+struct NesdisComponent {
+    Int representative;
+    std::vector<Int> vertices;
+};
 
-#ifdef CHOLMOD_NESDIS_USE_THREADS
-template<class Int, class F>
-static void foreach_group(const Int *ChildStack, const Int child_top, const F &f) {
-    Int group_end = child_top;
-    while (group_end >= 0) {
-        Int group_start = group_end;
-        while (group_start >= 0 && ChildStack [group_start] >= 0) group_start--;
-        ASSERT (group_start >= 0);
-        f(group_start, group_end);
-        group_end = group_start - 1 ;
+// Discover live components and compact their adjacency lists. Return groups in
+// the old stack's processing order, with vertices in the old graph builder's BFS
+// order. When nd_components is false, multiple components form one group per side.
+template<class Int>
+static std::vector<NesdisComponent<Int>> find_components_on_side(
+    cholmod_sparse *B, const Int *Map, Int cn, Int cnode, const Int *Part,
+    int part, Int *Bnz, Int *CParent, Int *State, Int mark,
+    Int *Queue, bool separate)
+{
+    const auto *Bp = static_cast<const Int *>(B->p);
+    auto *Bi = static_cast<Int *>(B->i);
+    std::vector<NesdisComponent<Int>> result;
+
+    NesdisComponent<Int> group{EMPTY, {}};
+    struct Layer { size_t begin, end; bool last; };
+    std::vector<Layer> layers;
+    std::vector<size_t> heads;
+    for (Int cj = 0; cj < cn; ++cj) {
+        if (Part && Part[cj] != part) continue;
+        const Int snode = Map ? Map[cj] : cj;
+        const Int state = State[snode];
+        if (state < EMPTY || state == mark) continue;
+        ASSERT(CParent[snode] == -2);
+        if (separate || group.representative == EMPTY) CParent[snode] = cnode;
+        if (group.representative == EMPTY) group.representative = snode;
+
+        Queue[0] = snode;
+        State[snode] = mark;
+        Int sn = 1, sj = 0;
+        if (!separate) heads.push_back(layers.size());
+        while (sj < sn) {
+            const Int layer_begin = sj, layer_end = sn;
+            for (; sj < layer_end; ++sj) {
+                const Int j = Queue[sj], pstart = Bp[j], pend = pstart + Bnz[j];
+                Int pdest = pstart;
+                for (Int p = pstart; p < pend; ++p) {
+                    const Int i = Bi[p];
+                    if (i == j) continue;
+                    const Int neighbor_state = State[i];
+                    if (neighbor_state < EMPTY) continue;
+                    Bi[pdest++] = i;
+                    if (neighbor_state != mark) {
+                        Queue[sn++] = i;
+                        State[i] = mark;
+                    }
+                }
+                Bnz[j] = pdest - pstart;
+            }
+            if (!separate)
+                layers.push_back({group.vertices.size() + (size_t)layer_begin,
+                                  group.vertices.size() + (size_t)layer_end, sj == sn});
+        }
+        if (separate) result.push_back({snode, std::vector<Int>(Queue, Queue + sn)});
+        else group.vertices.insert(group.vertices.end(), Queue, Queue + sn);
     }
+    if (!separate && group.representative != EMPTY) {
+        if (heads.size() > 1) {
+            // The old builder seeds one BFS with component representatives
+            // in reverse discovery order. Merge their saved layers to match
+            // that numbering, without traversing any adjacency again.
+            std::reverse(heads.begin(), heads.end());
+            std::vector<Int> ordered;
+            ordered.reserve(group.vertices.size());
+            for (size_t k = 0; k < heads.size(); ++k) {
+                const size_t index = heads[k];
+                const auto &layer = layers[index];
+                ordered.insert(ordered.end(), group.vertices.begin() + layer.begin,
+                               group.vertices.begin() + layer.end);
+                if (!layer.last) heads.push_back(index + 1);
+            }
+            group.vertices = std::move(ordered);
+        }
+        result.push_back(std::move(group));
+    }
+    std::reverse(result.begin(), result.end());
+    return result;
 }
 
 template<class Int>
-static void nesdis_process_child_groups_parallel
-(
-    nesdis_shared<Int> *S,
-    nesdis_local<Int> *L,
-    Int *ChildStack,
-    Int child_top,
-    Int depth
-)
+static std::vector<NesdisComponent<Int>> find_components(
+    cholmod_sparse *B, const Int *Map, Int cn, Int cnode, const Int *Part,
+    Int *Bnz, Int *CParent, Int *State,
+    Int *Queue, cholmod_common *Common, bool parallel = false)
 {
-    auto run_sequential = [ChildStack, S, L, depth](Int group_start, Int group_end) {
-        Int local_top = group_end - group_start;
-        nesdis_process_recursive<Int>(S, L, ChildStack + group_start, &local_top, depth);
+    // States below EMPTY retain CHOLMOD's removed-node encoding. Each discovery
+    // uses its removed parent separator's ID + 1 as a fresh nonnegative tag;
+    // that vertex cannot be a separator again. Initial discovery uses 0 when
+    // there is no dense-node parent. Tags need not increase along the tree.
+    // Concurrent searches touch disjoint live vertices; shared removed states
+    // remain unchanged, so neither atomics nor a shared counter are needed.
+    ASSERT(cnode >= EMPTY && cnode < (Int)B->nrow);
+    const Int mark = cnode + 1;
+    const bool separate = Common->method[Common->current].nd_components;
+    auto find_side = [&](int part, Int *queue) {
+        return find_components_on_side<Int>(B, Map, cn, cnode, Part, part,
+                Bnz, CParent, State, mark, queue, separate);
     };
+    if (!Part) return find_side(0, Queue);
 
-    if (depth >= S->MaxParallelDepth) {
-        return foreach_group<Int>(ChildStack, child_top, run_sequential);
+    std::vector<NesdisComponent<Int>> sides[2];
+    if (parallel) {
+        const Int side0_size = (Int)std::count(Part, Part + cn, 0);
+        // Sides touch disjoint vertices and use disjoint queue slices. Isolation
+        // prevents another component task from reusing the parent's TLS scratch
+        // while this thread waits; helpers never obtain their own TLS workspace.
+        tbb::this_task_arena::isolate([&] {
+            tbb::parallel_invoke(
+                [&] { sides[0] = find_side(0, Queue); },
+                [&] { sides[1] = find_side(1, Queue + side0_size); });
+        });
+    }
+    else {
+        sides[1] = find_side(1, Queue);
+        sides[0] = find_side(0, Queue);
+    }
+    auto &result = sides[0];
+    result.reserve(result.size() + sides[1].size());
+    for (auto &component : sides[1]) result.push_back(std::move(component));
+    return std::move(result);
+}
+
+template<class Int>
+static void nesdis_process_component(
+    nesdis_shared<Int> *S, nesdis_local<Int> *L,
+    const NesdisComponent<Int> &component, Int depth);
+
+template<class Int>
+static void nesdis_process_components(
+    nesdis_shared<Int> *S, nesdis_local<Int> *L,
+    std::vector<NesdisComponent<Int>> components, Int depth)
+{
+    if (S->UseParallel && depth < S->MaxParallelDepth) {
+        // Tasks own their vertex lists; the first group stays on this thread.
+        for (size_t k = 1; k < components.size(); ++k) {
+            S->TaskGroup.run([S, component = std::move(components[k]), depth]() {
+                auto &local = S->LocalWorkspaces.local();
+                if (!local) local = std::make_unique<nesdis_local<Int>>(S->n, S->csize, S->Common);
+                nesdis_process_component<Int>(S, local.get(), component, depth);
+            });
+        }
+        if (!components.empty()) nesdis_process_component<Int>(S, L, components.front(), depth);
         return;
     }
-
-    // We run the first group sequentially on this thread after launching the other groups in parallel.
-    std::pair<Int, Int> first_group;
-    bool has_first_group = false;
-
-    foreach_group<Int>(ChildStack, child_top, [ChildStack, S, depth, &has_first_group, &first_group](Int group_start, Int group_end) {
-        if (!has_first_group) {
-            first_group = {group_start, group_end};
-            has_first_group = true;
-            return;
-        }
-        // Note: we need to copy the stack now rather than at the start of the
-        // task. Otherwise the `ChildStack` held by the parent call frame
-        // may be destroyed by the time the task actually runs.
-        auto task_stack_ptr = std::make_shared<std::vector<Int>>(ChildStack + group_start,
-                                                                 ChildStack + group_end + 1);
-        S->TaskGroup.run([S, task_stack_ptr, depth]() {
-            Int local_top = task_stack_ptr->size() - 1;
-            auto &Local = S->LocalWorkspaces.local();
-            if (!Local) Local = std::make_unique<nesdis_local<Int>> (S->n, S->csize, S->Common);
-            nesdis_process_recursive<Int>(S, Local.get(), task_stack_ptr->data(), &local_top, depth);
-        });
-    });
-
-    if (has_first_group)
-        run_sequential(first_group.first, first_group.second);
-}
-
-static int nesdis_requested_num_threads
-(
-)
-{
-    const char *env_threads = std::getenv ("CHOLMOD_NESDIS_NUM_THREADS") ;
-    if (env_threads != NULL)
-    {
-        int requested_threads = std::atoi (env_threads) ;
-        if (requested_threads > 0)
-        {
-            return requested_threads ;
-        }
-    }
-    return 0 ;
-}
-
-template<class Int>
-static Int nesdis_serial_subtree_size
-(
-    Int nd_small
-)
-{
-    Int target_size = 2000 ;
-
-    const char *env_size = std::getenv ("CHOLMOD_NESDIS_SERIAL_SUBTREE_SIZE") ;
-    if (env_size != NULL)
-    {
-        long requested_size = std::atol (env_size) ;
-        if (requested_size > 0)
-        {
-            target_size = (Int) requested_size ;
-        }
-    }
-
-    return MAX (target_size, nd_small) ;
+    for (const auto &component : components)
+        nesdis_process_component<Int>(S, L, component, depth);
 }
 
 template<class Int>
 static int nesdis_max_parallel_depth
 (
     Int n,
-    Int nd_small
+    Int target_size
 )
 {
-    Int target_size = nesdis_serial_subtree_size<Int> (nd_small) ;
     if (n <= target_size)
     {
         return 0 ;
     }
 
     int depth = 0 ;
-    for (Int subtree_size = n ; subtree_size > target_size ; subtree_size = (subtree_size + 1) / 2)
+    for (Int subtree_size = n ; subtree_size > target_size ; subtree_size = subtree_size / 2 + subtree_size % 2)
     {
         ++depth ;
     }
@@ -299,8 +344,7 @@ static void nesdis_process_parallel
 (
     nesdis_shared<Int> *S,
     nesdis_local<Int> *MainLocal,
-    Int Cstack [ ],
-    Int *top,
+    std::vector<NesdisComponent<Int>> components,
     int max_parallel_depth
 )
 {
@@ -308,7 +352,8 @@ static void nesdis_process_parallel
     S->MaxParallelDepth = max_parallel_depth ;
 
     try {
-        nesdis_process_recursive<Int> (S, MainLocal, Cstack, top, 0) ;
+        // Initial connected components are independent, just like separator children.
+        nesdis_process_components<Int> (S, MainLocal, std::move(components), 0) ;
     }
     catch (...) {
         S->TaskGroup.cancel() ;
@@ -318,20 +363,17 @@ static void nesdis_process_parallel
     S->TaskGroup.wait();
 }
 
-#endif
-
 //------------------------------------------------------------------------------
-// nesdis_process_recursive
+// nesdis_process_component
 //------------------------------------------------------------------------------
 
 
 template<class Int>
-static void nesdis_process_recursive
+static void nesdis_process_component
 (
     nesdis_shared<Int> *S,
     nesdis_local<Int> *L,
-    Int Cstack [ ],
-    Int *top,
+    const NesdisComponent<Int> &component,
     Int depth
 )
 {
@@ -339,8 +381,7 @@ static void nesdis_process_recursive
     Int *Bi = S->Bi ;
     Int *Bnz = S->Bnz ;
     Int *Imap = L->Imap ;
-    Int *Map = L->Map ;
-    Int *Mark = L->Mark ;
+    const Int *Map = component.vertices.data() ;
     Int *Flag = S->Flag ;
     Int *Hash = L->Hash ;
     Int *Cmap = L->Cmap ;
@@ -354,57 +395,20 @@ static void nesdis_process_recursive
     cholmod_sparse *B = S->B ;
     cholmod_sparse *C = L->C ;
     cholmod_common *Common = L->Common ;
+    const bool compress = S->nd_compress != 0 ;
 
     using UInt = std::make_unsigned_t<Int> ;
-    Int cnode, cn, mark, i, j, cj, ci, cnz, pstart, pdest, pend, p,
-        total_weight, sepsize, parent, child_top ;
-    UInt hash ;
+    Int cnode = component.representative, cn = (Int)component.vertices.size();
+    Int i, j, cj, ci, cnz, total_weight, sepsize, parent;
+    DEBUG (Int p) ;
     DEBUG (Int cnt) ;
 
-    while (*top >= 0)
+    ASSERT(cn > 0 && cnode >= 0 && cnode < S->n);
+    if (cn < S->nd_small) {
+        for (Int v : component.vertices) Flag[v] = FLIP(cnode);
+        return;
+    }
     {
-
-        //----------------------------------------------------------------------
-        // get node(s) from the top of the Cstack
-        //----------------------------------------------------------------------
-
-        mark = local_clear_mark<Int> (NULL, 0, Mark, &(L->mark), S->n) ;
-        DEBUG (for (i = 0 ; i < S->n ; i++) Imap [i] = EMPTY) ;
-
-        cnode = EMPTY ;
-        cn = 0 ;
-        while (cnode == EMPTY)
-        {
-            i = Cstack [(*top)--] ;
-            Int raw_i = i ;
-
-            if (i < 0)
-            {
-                i = FLIP (i) ;
-                cnode = i ;
-            }
-
-            if (i < 0 || i >= S->n || Flag [i] < EMPTY)
-            {
-                fprintf (stderr,
-                    "CHOLMOD_NESDIS_BAD_POP depth=%lld top_after=%lld "
-                    "raw=%lld node=%lld n=%lld flag=%lld\n",
-                    (long long) depth, (long long) *top,
-                    (long long) raw_i, (long long) i, (long long) S->n,
-                    (long long) ((i >= 0 && i < S->n) ? Flag [i] : EMPTY - 1)) ;
-                throw nesdis_failure (CHOLMOD_INVALID) ;
-            }
-
-            ASSERT (i >= 0 && i < S->n && Flag [i] >= EMPTY) ;
-
-            Map [cn] = i ;
-            Mark [i] = mark ;
-            Imap [i] = cn ;
-            cn++ ;
-        }
-
-        ASSERT (cnode != EMPTY) ;
-
         //----------------------------------------------------------------------
         // create the subgraph for this connected component C
         //----------------------------------------------------------------------
@@ -414,40 +418,43 @@ static void nesdis_process_recursive
         for (cj = 0 ; cj < cn ; cj++)
         {
             j = Map [cj] ;
-            ASSERT (Mark [j] == mark) ;
+            Imap[j] = cj;
             Cp [cj] = cnz ;
             Cnw [cj] = Bnw [j] ;
             ASSERT (Cnw [cj] >= 0) ;
             total_weight += Cnw [cj] ;
-            pstart = Bp [j] ;
-            pdest = pstart ;
-            pend = pstart + Bnz [j] ;
-            hash = cj ;
-            for (p = pstart ; p < pend ; p++)
-            {
-                i = Bi [p] ;
-                if (i != j && Flag [i] >= EMPTY)
-                {
-                    Bi [pdest++] = i ;
-                    if (Mark [i] != mark)
-                    {
-                        Map [cn] = i ;
-                        Mark [i] = mark ;
-                        Imap [i] = cn ;
-                        cn++ ;
-                    }
-                    ci = Imap [i] ;
-                    ASSERT (ci >= 0 && ci < cn && ci != cj && cnz < S->csize) ;
-                    Ci [cnz++] = ci ;
-                    hash += ci ;
-                }
-            }
-            Bnz [j] = pdest - pstart ;
-            hash %= S->csize ;
-            Hash [cj] = (Int) hash ;
-            ASSERT (Hash [cj] >= 0 && Hash [cj] < S->csize) ;
+            cnz += Bnz[j];
         }
         Cp [cn] = cnz ;
+        auto fill_column = [&](Int column) {
+            const Int vertex = Map[column], start = Bp[vertex];
+            UInt hash = column;
+            for (Int k = 0; k < Bnz[vertex]; ++k) {
+                const Int neighbor = Bi[start + k];
+                // Discovery already removed self-edges and deleted vertices.
+                ASSERT(neighbor != vertex && Flag[neighbor] >= EMPTY);
+                const Int local = Imap[neighbor];
+                ASSERT(local >= 0 && local < cn && local != column && Cp[column] + k < S->csize);
+                Ci[Cp[column] + k] = local;
+                if (compress) hash += local;
+            }
+            if (compress) {
+                hash %= S->csize ;
+                Hash[column] = (Int)hash;
+            }
+        };
+        const bool parallel_construction = !compress && S->UseParallel && depth < S->MaxParallelDepth &&
+                                           cn > S->SerialSubtreeSize;
+        if (parallel_construction) {
+            // Imap is complete and Cp gives disjoint output slices. Protect the
+            // parent's TLS scratch while waiting, just as in component discovery.
+            tbb::this_task_arena::isolate([&] {
+                tbb::parallel_for(tbb::blocked_range<Int>(0, cn, 128), [&](const auto &range) {
+                    for (Int column = range.begin(); column < range.end(); ++column) fill_column(column);
+                });
+            });
+        }
+        else for (Int column = 0; column < cn; ++column) fill_column(column);
         C->nrow = cn ;
         C->ncol = cn ;
 
@@ -471,13 +478,7 @@ static void nesdis_process_recursive
         }
         #endif
 
-        PRINT0 (("consider cn %d nd_small %d ", cn, S->nd_small)) ;
-        if (cn < S->nd_small)
-        {
-            PRINT0 ((" too small\n")) ;
-            sepsize = total_weight ;
-        }
-        else
+        ASSERT(cn >= S->nd_small);
         {
             PRINT0 ((" cut\n")) ;
 
@@ -485,8 +486,8 @@ static void nesdis_process_recursive
                 #ifndef NDEBUG
                 S->csize,
                 #endif
-                S->nd_compress, depth, Hash, C, Cnw, Cew,
-                Cmap, Part, Common) ;
+                compress, depth, Hash, C, Cnw, Cew,
+                Cmap, Part, Common, S->Bisector) ;
 
             if (sepsize < 0)
             {
@@ -494,7 +495,7 @@ static void nesdis_process_recursive
                 throw nesdis_failure (Common->status) ;
             }
 
-            for (ci = 0 ; ci < cn ; ci++)
+            if (compress) for (ci = 0 ; ci < cn ; ci++)
             {
                 if (Hash [ci] < EMPTY)
                 {
@@ -511,8 +512,9 @@ static void nesdis_process_recursive
                 }
             }
 
-            DEBUG (for (cnt = 0, j = 0 ; j < S->n ; j++) cnt += Bnw [j]) ;
-            ASSERT (cnt == S->n) ;
+            // Only inspect this component: other tasks may modify Bnw elsewhere.
+            DEBUG (for (cnt = 0, cj = 0 ; cj < cn ; cj++) cnt += Bnw [Map [cj]]) ;
+            ASSERT (cnt == total_weight) ;
         }
 
         ASSERT (sepsize >= 0 && sepsize <= total_weight) ;
@@ -567,28 +569,10 @@ static void nesdis_process_recursive
             ASSERT (CParent [cnode] == -2) ;
             CParent [cnode] = parent ;
 
-#ifdef CHOLMOD_NESDIS_USE_THREADS
-            if (S->UseParallel)
-            {
-                child_top = EMPTY ;
-                std::vector<Int> ChildStackStorage ((size_t) cn) ;
-                Int *ChildStack = ChildStackStorage.data () ;
-                find_components<Int> (B, Map, cn, cnode, Part, Bnz,
-                        CParent, ChildStack, &child_top,
-                        Flag, Mark, &(L->mark), Imap, Common) ;
-                nesdis_process_child_groups_parallel<Int> (S, L, ChildStack,
-                        child_top, depth + 1) ;
-                continue ;
-            }
-#endif
-            child_top = EMPTY ;
-            std::vector<Int> ChildStackStorage ((size_t) cn) ;
-            Int *ChildStack = ChildStackStorage.data () ;
-            find_components<Int> (B, Map, cn, cnode, Part, Bnz,
-                    CParent, ChildStack, &child_top,
-                    Flag, Mark, &(L->mark), Imap, Common) ;
-            nesdis_process_recursive<Int> (S, L, ChildStack, &child_top,
-                    depth + 1) ;
+            const bool parallel_discovery = S->UseParallel && depth < S->MaxParallelDepth;
+            auto children = find_components<Int>(B, Map, cn, cnode, Part, Bnz,
+                    CParent, Flag, Imap, Common, parallel_discovery);
+            nesdis_process_components<Int>(S, L, std::move(children), depth + 1);
         }
     }
 }
@@ -598,23 +582,49 @@ static void nesdis_process_recursive
 // cholmod_nested_dissection
 //------------------------------------------------------------------------------
 
-// This method uses a node bisector, applied recursively (but using a
-// non-recursive algorithm).  Once the graph is partitioned, it calls a
+// This method uses a node bisector, applied recursively. Once the graph is partitioned, it calls a
 // constrained min degree code (CAMD or CSYMAMD for A+A', and CCOLAMD for A*A')
 // to order all the nodes in the graph - but obeying the constraints determined
 // by the separators.  This routine is similar to METIS_NodeND, except for how
 // it treats the leaf nodes.  METIS_NodeND orders the leaves of the separator
 // tree with MMD, ignoring the rest of the matrix when ordering a single leaf.
-// This routine orders the whole matrix with CSYMAMD or CCOLAMD, all at once,
-// when the graph partitioning is done.
+// After partitioning, symmetric inputs use hierarchical CAMD by default, or
+// global CAMD/CSYMAMD when requested. Unsymmetric inputs retain CCOLAMD.
 //
-// This function also returns a postorderd separator tree (CParent), and a
+// This function also returns a postordered separator tree (CParent), and a
 // mapping of nodes in the graph to nodes in the separator tree (Cmember).
 //
 // workspace: Flag (nrow), Head (nrow+1), Iwork (4*nrow + (ncol if unsymmetric))
-//      Allocates a temporary matrix B=A*A' or B=A,
-//      and O(nnz(A)) temporary memory space.
-//      Allocates an additional 3*n*sizeof(Int) temporary workspace
+//      Allocates a mutable full graph B and node weights Bnw.
+//      Each local workspace owns O(n + nnz(B)) storage; tasks own vertex lists.
+
+// Copy indices without symmetrizing. Leave diagonals for discovery to prune;
+// the dense-node degree test below excludes them before that first traversal.
+template<class Int>
+static cholmod_sparse *copy_full_graph(const cholmod_sparse &graph, cholmod_common *Common)
+{
+    const auto *Ap = static_cast<const Int *>(graph.p);
+    const auto *Ai = static_cast<const Int *>(graph.i);
+    auto *B = CholmodApi<Int>::allocate_sparse(graph.nrow, graph.ncol,
+            Ap[graph.ncol], TRUE, TRUE, 0, CHOLMOD_PATTERN, Common);
+    if (!B) return nullptr;
+    auto *Bp = static_cast<Int *>(B->p);
+    auto *Bi = static_cast<Int *>(B->i);
+    try {
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, graph.ncol, 256), [&](const auto &range) {
+            for (size_t j = range.begin(); j < range.end(); ++j) {
+                Bp[j] = Ap[j];
+                if (Ap[j + 1] > Ap[j]) std::copy(Ai + Ap[j], Ai + Ap[j + 1], Bi + Ap[j]);
+            }
+        });
+        Bp[graph.ncol] = Ap[graph.ncol];
+    }
+    catch (...) {
+        CholmodApi<Int>::free_sparse(&B, Common);
+        throw;
+    }
+    return B;
+}
 
 template<class Int>
 static int64_t nested_dissection_impl // returns # of components, or -1 if error
@@ -630,9 +640,12 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
                         // c is in the range 0 to # of components minus 1
     Int *Cmember,       // size A->nrow.  Cmember [j] = c if node j of A is
                         // in component c
-    cholmod_common *Common
+    cholmod_common *Common,
+    const NesdisOptions &options,
+    const cholmod_sparse *FullGraph = nullptr
 )
 {
+    const auto nesdis_start = std::chrono::steady_clock::now();
 
     //--------------------------------------------------------------------------
     // check inputs
@@ -640,14 +653,12 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
 
 
     double prune_dense, nd_oksep ;
-    using UInt = std::make_unsigned_t<Int> ;
-    Int *Bp, *Bi, *Bnz, *Cstack, *Flag, *Head, *Next, *Bnw, *Iwork,
+    Int *Bp, *Bi, *Bnz, *Flag, *Head, *Next, *Bnw, *Iwork,
         *Ipost, *NewParent, *Post ;
-    UInt hash ;
-    Int n, bnz, top, i, j, k, cnode, cdense, p, cj, cn, ci, cnz, mark, c,
-        sepsize, parent, ncomponents, threshold, ndense, pstart, pdest, pend,
-        nd_compress, nd_camd, csize, jnext, nd_small, total_weight,
-        nchild, local_mark, child = EMPTY ;
+    Int n, bnz, i, j, k, cnode, cdense, c,
+        parent, ncomponents, threshold, ndense,
+        nd_compress, nd_camd, csize, jnext, nd_small,
+        nchild, child = EMPTY ;
     cholmod_sparse *B ;
     DEBUG (Int cnt) ;
 
@@ -720,8 +731,6 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
 
     Bnw = NULL ;
 
-    Cstack = Perm ;             // size n, use Perm as workspace for Cstack [
-
     if (Common->status < CHOLMOD_OK)
     {
         return (EMPTY) ;
@@ -733,7 +742,11 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
 
     // B = A+A', A*A', or A(:,f)*A(:,f)', upper and lower parts present
 
-    if (A->stype)
+    if (FullGraph)
+    {
+        B = copy_full_graph<Int>(*FullGraph, Common);
+    }
+    else if (A->stype)
     {
         // Add the upper/lower part to a symmetric lower/upper matrix by
         // converting to unsymmetric mode
@@ -761,7 +774,7 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
     // initializations
     //--------------------------------------------------------------------------
 
-    // all nodes start out unmarked and unordered (Type 4, see below)
+    // All nodes start out live and unvisited.
     Common->mark = EMPTY ;
     clear_common_flag<Int> (Common) ;
     ASSERT (Flag == Common->Flag) ;
@@ -790,7 +803,9 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
     for (j = 0 ; j < n ; j++)
     {
         Bnz [j] = Bp [j+1] - Bp [j] ;
-        if (Bnz [j] > threshold)
+        Int degree = Bnz[j];
+        if (FullGraph && std::binary_search(Bi + Bp[j], Bi + Bp[j + 1], j)) --degree;
+        if (degree > threshold)
         {
             // node j is dense, prune it from B
             PRINT2 (("j is dense %d\n", j)) ;
@@ -823,7 +838,7 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
         CholmodApi<Int>::free_sparse (&B, Common) ;
         Common->mark = EMPTY ;
         clear_common_flag<Int> (Common) ;
-            return (1) ;
+        return (1) ;
     }
 
     Bnw = (Int *) CholmodApi<Int>::malloc (n, sizeof (Int), Common) ;
@@ -835,37 +850,28 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
         CholmodApi<Int>::free (n, sizeof (Int), Bnw, Common) ;
         Common->mark = EMPTY ;
         clear_common_flag<Int> (Common) ;
-            PRINT2 (("out of memory for Bnw\n")) ;
+        PRINT2 (("out of memory for Bnw\n")) ;
         return (EMPTY) ;
     }
 
+    const auto partition_start = std::chrono::steady_clock::now();
     try
     {
     nesdis_local<Int> L (n, csize, Common) ;
 
-    // create initial unit node and edge weights
+    // create initial unit node weights
     for (j = 0 ; j < n ; j++)
     {
         Bnw [j] = 1 ;
     }
-    for (p = 0 ; p < csize ; p++)
-    {
-        L.Cew [p] = 1 ;
-    }
-
-    // push the initial connnected components of B onto the Cstack
-    top = EMPTY ;       // Cstack is empty
-    local_mark = L.mark ;
+    // Discover initial component groups and retain their vertex lists.
     // workspace: Flag (nrow), Iwork (nrow); use Imap as workspace for Queue [
-    find_components<Int> (B, NULL, n, cnode, NULL,
-            Bnz, CParent, Cstack, &top,
-            Flag, L.Mark, &local_mark, L.Imap, Common) ;
-    L.mark = local_mark ;
+    auto components = find_components<Int> (B, NULL, n, cnode, NULL,
+            Bnz, CParent,
+            Flag, L.Imap, Common) ;
     // done using Imap as workspace for Queue ]
 
-    // Nodes can now be of Type 0, 1, 2, or 4 (see definition below)
-
-    nesdis_shared<Int> S ;
+    nesdis_shared<Int> S (options) ;
     S.n = n ;
     S.csize = csize ;
     S.nd_compress = nd_compress ;
@@ -879,57 +885,34 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
     S.Bnw = Bnw ;
     S.CParent = CParent ;
     S.Common = Common ;
-#ifdef CHOLMOD_NESDIS_USE_THREADS
-    S.UseParallel = FALSE ;
-    S.MaxParallelDepth = 0 ;
-#endif
-
-#ifdef CHOLMOD_NESDIS_USE_THREADS
-    int max_parallel_depth = nesdis_max_parallel_depth<Int> (n, nd_small) ;
+    S.SerialSubtreeSize = (Int)std::max<int64_t>(nd_small,
+        std::min<int64_t>(options.serial_subtree_size, std::numeric_limits<Int>::max()));
+    int max_parallel_depth = nesdis_max_parallel_depth<Int> (n, S.SerialSubtreeSize) ;
     if (max_parallel_depth > 0) {
-        std::unique_ptr<tbb::global_control> thread_limit ;
-        int requested_nthreads = nesdis_requested_num_threads () ;
-        if (requested_nthreads > 0)
-            thread_limit = std::make_unique<tbb::global_control> (
-                    tbb::global_control::max_allowed_parallelism, requested_nthreads) ;
-
-        nesdis_process_parallel<Int> (&S, &L, Cstack, &top, max_parallel_depth) ;
+        nesdis_process_parallel<Int> (&S, &L, std::move(components), max_parallel_depth) ;
     }
     else
-#endif
     {
-        nesdis_process_recursive<Int> (&S, &L, Cstack, &top, 0) ;
+        nesdis_process_components<Int> (&S, &L, std::move(components), 0) ;
     }
-    }
-    catch (nesdis_failure &failure)
-    {
-        Common->status = (failure.status < CHOLMOD_OK) ?
-            failure.status : CHOLMOD_INVALID ;
-        CholmodApi<Int>::free_sparse (&B, Common) ;
-        CholmodApi<Int>::free (n, sizeof (Int), Bnw, Common) ;
-        Common->mark = EMPTY ;
-        clear_common_flag<Int> (Common) ;
-            PRINT2 (("nested dissection workspace allocation failed\n")) ;
-        return (EMPTY) ;
     }
     catch (...)
     {
-        Common->status = CHOLMOD_OUT_OF_MEMORY ;
         CholmodApi<Int>::free_sparse (&B, Common) ;
         CholmodApi<Int>::free (n, sizeof (Int), Bnw, Common) ;
         Common->mark = EMPTY ;
         clear_common_flag<Int> (Common) ;
-            PRINT2 (("nested dissection failed with C++ exception\n")) ;
-        return (EMPTY) ;
+        throw ;
     }
 
-    // done using Perm as workspace for Cstack ]
+    const double partition_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - partition_start).count();
 
     //--------------------------------------------------------------------------
     // place nodes removed via compression into their proper component
     //--------------------------------------------------------------------------
 
-    // At this point, all nodes are of Type 1, 2, or 3, as defined above.
+    // All vertices are removed; Flag links absorbed vertices to representatives.
 
     for (i = 0 ; i < n ; i++)
     {
@@ -1137,6 +1120,10 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
 
     PRINT1 (("nd_camd: %d A->stype %d\n", nd_camd, A->stype)) ;
 
+    const bool camd_trace = options.camd.trace;
+    if (options.trace_tree)
+        trace_camd_tree((size_t)n, CParent, ncomponents, Cmember);
+
     if (nd_camd)
     {
 
@@ -1150,7 +1137,12 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
             // Add the upper/lower part to a symmetric lower/upper matrix by
             // converting to unsymmetric mode
             // workspace: Iwork (nrow)
-            B = CholmodApi<Int>::copy (A, 0, -1, Common) ;
+            cholmod_sparse original_graph;
+            if (FullGraph) {
+                original_graph = *FullGraph;
+                B = &original_graph;
+            }
+            else B = CholmodApi<Int>::copy (A, 0, -1, Common) ;
             if (Common->status < CHOLMOD_OK)
             {
                 PRINT0 (("make symmetric failed\n")) ;
@@ -1158,18 +1150,49 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
             }
             ASSERT ((Int) (B->nrow) == n && (Int) (B->ncol) == n) ;
             PRINT2 (("nested dissection (2)\n")) ;
-            B->stype = -1 ;
-            if (nd_camd == 2)
+            bool hierarchical = false;
+            auto camd_start = std::chrono::steady_clock::now();
+            if (nd_camd == 1)
             {
+                // B is the original graph (borrowed or copied): compression and
+                // dense-node pruning affect membership, not this CAMD input.
+                try {
+                    hierarchical = options.camd.cut_depth >= 0 && ncomponents > 1;
+                    if (hierarchical) {
+                        auto result = hierarchical_camd(*B, CParent, ncomponents, Cmember, *Common, options.camd);
+                        std::copy(result.permutation.begin(), result.permutation.end(), Perm);
+                        // Local CAMD estimates omit boundary interactions; summing
+                        // them would not estimate the full factor's nnz or flops.
+                        Common->lnz = Common->fl = -1;
+                        ok = TRUE;
+                    }
+                    else {
+                        B->stype = -1;
+                        ok = CholmodApi<Int>::camd(B, NULL, 0, Cmember, Perm, Common);
+                    }
+                }
+                catch (...) {
+                    if (!FullGraph) CholmodApi<Int>::free_sparse(&B, Common);
+                    throw;
+                }
+            }
+            else if (nd_camd == 2)
+            {
+                B->stype = -1 ;
                 // workspace:  Head (nrow+1), Iwork (nrow) if symmetric-upper
                 ok = CholmodApi<Int>::csymamd (B, Cmember, Perm, Common) ;
             }
             else
             {
+                B->stype = -1 ;
                 // workspace: Head (nrow), Iwork (4*nrow)
                 ok = CholmodApi<Int>::camd (B, NULL, 0, Cmember, Perm, Common) ;
             }
-            CholmodApi<Int>::free_sparse (&B, Common) ;
+            if (camd_trace)
+                std::fprintf(stderr, "CAMD_TOTAL {\"hierarchical\":%s,\"vertices\":%lld,\"seconds\":%.9g,\"ok\":%d}\n",
+                    hierarchical ? "true" : "false", (long long)n,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - camd_start).count(), ok);
+            if (!FullGraph) CholmodApi<Int>::free_sparse (&B, Common) ;
             if (!ok)
             {
                 // failed
@@ -1237,6 +1260,9 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
     // clear workspace and return number of components
     //--------------------------------------------------------------------------
 
+    if (camd_trace)
+        std::fprintf(stderr, "NESDIS_TOTAL {\"seconds\":%.9g,\"partition_seconds\":%.9g}\n",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - nesdis_start).count(), partition_seconds);
     return (ncomponents) ;
 }
 
@@ -1245,9 +1271,53 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
 template<class Int>
 static int64_t nested_dissection_checked(cholmod_sparse *A, Int *fset, size_t fsize,
                                          Int *Perm, Int *CParent, Int *Cmember,
-                                         cholmod_common *Common) {
-    return nested_dissection_impl<Int>(A, fset, fsize, Perm, CParent, Cmember, Common);
+                                         cholmod_common *Common,
+                                         const cholmod_sparse *FullGraph = nullptr) noexcept {
+    if (!Common) return EMPTY;
+    // The C and full-graph APIs share one exception boundary, including optional
+    // diagnostics. Internal catches only clean up owned storage before rethrowing.
+    try {
+        const NesdisOptions options;
+        std::unique_ptr<tbb::global_control> thread_limit;
+        if (options.threads) thread_limit = std::make_unique<tbb::global_control>(
+            tbb::global_control::max_allowed_parallelism, options.threads);
+        return nested_dissection_impl<Int>(A, fset, fsize, Perm, CParent, Cmember, Common, options, FullGraph);
+    }
+    catch (const nesdis_failure &failure) {
+        Common->status = failure.status < CHOLMOD_OK ? failure.status : CHOLMOD_INVALID;
+    }
+    catch (const std::bad_alloc &) { Common->status = CHOLMOD_OUT_OF_MEMORY; }
+    catch (const std::exception &e) {
+        Common->status = CHOLMOD_INVALID;
+        std::fprintf(stderr, "nested dissection: %s\n", e.what());
+    }
+    catch (...) { Common->status = CHOLMOD_INVALID; }
+    return EMPTY;
 }
+
+template<class Int>
+int64_t nested_dissection_from_graph(const cholmod_sparse &graph,
+    Int *Perm, Int *CParent, Int *Cmember, cholmod_common *Common)
+{
+    if (!Common) return EMPTY;
+    const int itype = sizeof(Int) == sizeof(int32_t) ? CHOLMOD_INT : CHOLMOD_LONG;
+    if (graph.nrow != graph.ncol || graph.nrow > (size_t)std::numeric_limits<Int>::max() ||
+        graph.stype != 0 || !graph.packed || !graph.sorted ||
+        graph.itype != itype || Common->itype != itype || !graph.p ||
+        (!graph.i && graph.nzmax != 0)) {
+        Common->status = CHOLMOD_INVALID;
+        return EMPTY;
+    }
+    // Only this explicit graph API bypasses A*A' semantics for stype == 0.
+    auto A = graph;
+    A.stype = 1;
+    return nested_dissection_checked<Int>(&A, nullptr, 0, Perm, CParent, Cmember, Common, &graph);
+}
+
+template int64_t nested_dissection_from_graph<int32_t>(const cholmod_sparse &,
+    int32_t *, int32_t *, int32_t *, cholmod_common *);
+template int64_t nested_dissection_from_graph<int64_t>(const cholmod_sparse &,
+    int64_t *, int64_t *, int64_t *, cholmod_common *);
 
 } // namespace MeshFEM::CholmodParallelNesdis
 

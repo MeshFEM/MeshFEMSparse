@@ -10,6 +10,10 @@ target_link_libraries(MeshFEMSparse_unit_tests PUBLIC
     warnings::all
 )
 
+if (MESHFEM_WITH_CHOLMOD)
+    target_sources(MeshFEMSparse_unit_tests PRIVATE test_hierarchical_camd.cc)
+endif()
+
 if (MSVC)
 else ()
 target_compile_options(MeshFEMSparse_unit_tests PRIVATE -Wno-unused-parameter)

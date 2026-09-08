@@ -209,6 +209,7 @@ void PardisoFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const st
 
     iparm[0] = 1; // Use custom options.
     iparm[4] = 0; // Default to Pardiso-provided ordering.
+    m_cholmodOrdering.setNestedDissectionCompression(m_blockSize == 1);
 
     if (orderingMethod == OrderingMethod::AMD) iparm[1] = 0;
     else if (orderingMethod == OrderingMethod::Metis) iparm[1] = 2;

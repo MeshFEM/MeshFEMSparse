@@ -147,6 +147,7 @@ void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &
         m_opts.order = nullptr;
     }
 
+    m_cholmodOrdering.setNestedDissectionCompression(m_blockSize == 1);
     if (orderingMethod == OrderingMethod::AMD) {
         m_opts.orderMethod = SparseOrderAMD;
     }

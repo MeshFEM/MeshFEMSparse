@@ -85,7 +85,7 @@ if (MESHFEM_WITH_CATAMARI AND NOT TARGET catamari)
 endif()
 
 if (MESHFEM_WITH_SCOTCH)
-    find_package(SCOTCH QUIET)
+    find_package(SCOTCH 7 QUIET)
     if (NOT TARGET SCOTCH::scotch)
         message(STATUS "Scotch not found; support will be disabled")
         set(MESHFEM_WITH_SCOTCH OFF)

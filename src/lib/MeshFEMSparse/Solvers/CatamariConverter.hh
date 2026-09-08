@@ -42,7 +42,9 @@ struct CatamariConverter {
     // We retain this to support legacy-Catamari mode, but for best efficiency,
     // the caller should pass `blockSize = 1` and interpret the converter's
     // entries as representing blocks of the appropriate size.
-    CatamariConverter(const SuiteSparseMatrix &Asp_in, const size_t blockSize, bool legacy, const std::vector<SuiteSparse_long> &entryForReducedEntry)
+    // Optionally transfer the full sparsity-only CSC to the ordering caller.
+    CatamariConverter(const SuiteSparseMatrix &Asp_in, const size_t blockSize, bool legacy, const std::vector<SuiteSparse_long> &entryForReducedEntry,
+                     CSCMatrix<SuiteSparse_long, SuiteSparse_long> *fullPattern = nullptr)
         : m_legacy(legacy)
     {
 #ifdef MESHFEM_USE_LEGACY_CATAMARI
@@ -106,6 +108,7 @@ struct CatamariConverter {
 #endif
 
             m_sourceReducedEntryForFullMatrixEntry = std::move(A_full.Ax);
+            if (fullPattern) *fullPattern = std::move(A_full);
         }
 
         if (legacy) {

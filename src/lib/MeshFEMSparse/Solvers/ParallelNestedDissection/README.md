@@ -2,28 +2,103 @@
 
 This directory contains a modified version of cholmod_nesdis.c that introduces
 TBB-based parallelism (i.e., a parallel traversal of the separator tree). The
-original iterative algorithm was refactored to use explicit recursion since I
-thought this would simplify thread scheduling, but in retrospect this probably
-was not actually necessary. The main tricky implementation point was ensuring
-that state modified by the recursive calls is stored in thread-local copies.
+original iterative algorithm was refactored to use explicit recursion to simplify
+lifetime management of component stacks. The main tricky implementation point
+was ensuring that state modified by the recursive calls is stored in
+thread-local copies. Exploiting this parallelism has no impact on the final
+ordering.
 
-This gets a solid speedup over the serial version (~2-3x on test matrices)
-without changing the ordering. The speedup is limited by the critical
-path of the separator tree, which is dominated by the global top-level
-bisection done at the start. I have experimented with several
-parallel partitioning codes (like mt-KaHIP and mt-Metis) for just the topmost
-(or high-up) bisections but found they were either slower than the serial Metis or
-produced substantially lower-quality separators; still, this seems to be the
-main opportunity for further speedup.
+After parallelizing nested dissection, the time overhead of the `cholmod_nesdis`
+algorithm's subsequent global CAMD ordering step becomes significant. This can
+be avoided by setting the CHOLMOD options `nd_camd = 0` at the expense of
+seriously degrading ordering quality; this degradation is less if `nd_small` is
+reduced from the CHOLMOD default (200) to, e.g., `50` or `25`. In the standard
+METIS ND implementation (e.g., `cholmod_metis`), the global CAMD is replaced
+with CAMD ordering of the leaves; this is trivial to parallelize but tends to
+produce slightly worse ordering since the separator nodes don't get reordered.
+We have instead implemented a "hybrid" approach where separate CAMD
+calls are made for each subtree at a configurable "cut depth"
+(environment variable `CHOLMOD_NESDIS_CAMD_CUT_DEPTH`)
+in parallel. Then a final CAMD is run at the upper part of the tree,
+incorporating degree information from the quotient elements/cliques of each subtree.
+This strategy allows us to interpolate between approximating the
+`cholmod_metis` and `cholmod_nesdis` orderings:
+the algorithm is similar to METIS_ND if we set a high cut depth
+(and `CHOLMOD_NESDIS_CAMD_SKIP_UPPER=1` to avoid the final upper-level CAMD call),
+while we can precisely reproduce `cholmod_nesdis` by setting a cut depth of -1.
+Skipping upper CAMD keeps natural ordering inside each upper component.
 
-There is also a significant serial postprocessing time introduced by the
-global `camd` ordering step. This can be avoided by setting the CHOLMOD options
-`nd_camd = 0` at the expense of degrading ordering quality; this degradation is
-less if `nd_small` is reduced from the CHOLMOD default (200) to, e.g., `50` or `25`.
-Another option would be to run AMD in parallel on the leaf nodes (essentially
-a parallel version of `cholmod_metis`, which tends to be a slightly inferior
-ordering). An even better option would be to implement a parallel approximation
-to CAMD (parallelized using the separator tree), which is ongoing work.
+Nested dissection time is dominated by separator computation, even more so
+after several low-level optimizations described further down.
+We default to using METIS with the same settings as the original
+`cholmod_nesdis` code. In our experiments, this yields the highest-quality
+separators, but it is a serial code and runs slower than other
+partitioners. We have experimented with other multithreaded
+partitioning codes (mt-KaHIP, mt-METIS, SCOTCH) and found SCOTCH to
+provide the best trade-off between quality and speed among them.
+We have therefore exposed an option to use SCOTCH to construct
+the upper levels of the separator tree
+(down to depth `CHOLMOD_NESDIS_SCOTCH_LEVELS`, with a setting of 0 disabling it).
+Note that accelerating these top-level calls has the greatest impact
+on ordering time since they dominate the critical path
+at high core count (there is sufficient tree parallelism
+in the lower levels that we want to run a serial partitioner like METIS anyway).
+By adjusting `CHOLMOD_NESDIS_SCOTCH_LEVELS`
+and `CHOLMOD_NESDIS_SCOTCH_STRATEGY`, different trade-offs can be selected between
+ordering speed and quality; see [scotch_bisector.md](scotch_bisector.md)
+for additional configuration details.
+
+## Lower-level Accelerations
+
+`CholmodOrdering` enables CHOLMOD's graph compression by default. Catamari,
+Accelerate and Pardiso disable it only when their actual block size exceeds one,
+after any scalar fallback. The per-instance `setNestedDissectionCompression`
+setting updates both existing integer-width contexts and future ones. Direct
+calls to the nested-dissection routines continue to respect `Common` settings.
+
+Especially when using an inexpensive partitioner
+(e.g., `CHOLMOD_NESDIS_SCOTCH_LEVELS=8 CHOLMOD_NESDIS_SCOTCH_STRATEGY=fast`),
+other stages of the `cholmod_nesdis` algorithm begin to take nontrivial time.
+
+Component discovery (`find_components`) now retains BFS-ordered vertex lists,
+owned by the child tasks. Graph construction reuses those lists and the
+already-pruned adjacency instead of rediscovering vertices, and small leaves
+skip graph construction. When disconnected components are grouped together,
+their saved BFS layers are interleaved to preserve the original multi-source BFS
+numbering. This retains the serial traversal path. With compression disabled,
+large components build their local adjacency in parallel: a serial vertex pass
+fills the inverse map and column offsets, then TBB remaps neighbors into
+disjoint column slices.
+We also reduced the number of workspace arrays used by this algorithm (removing
+the `Mark` array) by encoding both liveness and visitation in `Flag`: values
+below -1 retain CHOLMOD's removed-node encoding, -1 means initially unvisited,
+and nonnegative values are visit tags. A search uses its removed parent
+separator's vertex ID plus one as its tag (zero for initial discovery without a
+dense-node parent). This ID cannot recur in a descendant separator because that
+vertex is removed; tags need not increase with depth.
+
+We furthermore enable a bypass of CHOLMOD's serial upper-tri-to-full conversion
+by supplying the full sparsity pattern (to the `nested_dissection_from_graph`
+inteface). This inteface is now used by `CatamariFactorizer`, which already
+needed to do this conversion, and did it with our faster parallel
+implementation.
+
+## Configuration and errors
+
+Environment settings are parsed once per ordering call, before allocating graph
+or traversal storage. Integer values must be complete decimal integers without
+whitespace; malformed or out-of-range values fail with `CHOLMOD_INVALID`.
+`CHOLMOD_NESDIS_NUM_THREADS` defaults to zero (inherit the existing TBB limit).
+A positive value adds a limit for the entire call, including graph construction
+and CAMD; it cannot raise another active TBB limit. `CHOLMOD_NESDIS_SERIAL_SUBTREE_SIZE`
+must be positive and defaults to 2000. SCOTCH settings are documented in
+[scotch_bisector.md](scotch_bisector.md).
+
+Both C entry points and the full-graph C++ entry point return -1 on failure and
+set `Common->status`. C++ allocation failures map to `CHOLMOD_OUT_OF_MEMORY`;
+invalid settings and other exceptions map to `CHOLMOD_INVALID`.
+We now use C++ exceptions internally to cancel parallel execution
+and simplify cleanup upon failures, but no exceptions excape these functions.
 
 ## License
 

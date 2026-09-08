@@ -157,6 +157,7 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
         reducedRowForRow_block = m_reducedRowForRow;
     }
 
+    m_cholmodOrdering.setNestedDissectionCompression(m_blockSize == 1);
     m_permutedReducedRowForRow.clear(); // The upcoming symbolic factorization will change any existing permutation...
 
     BENCHMARK_SCOPED_TIMER_SECTION timer("Catamari Symbolic Factorize");
@@ -168,7 +169,11 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
         BENCHMARK_SCOPED_TIMER_SECTION t2("CatamariConverter_reset");
         m_catamariConverter.reset();
     }
-    m_catamariConverter = std::make_unique<CatamariConverter>(*A_reduced, /* block_size = */ 1, m_legacy, m_entryForReducedEntry);
+    CSCMatrix<SuiteSparse_long, SuiteSparse_long> fullPattern;
+    const bool retainFullPattern = orderingMethod == OrderingMethod::CholmodNesdisParallel ||
+                                   orderingMethod == OrderingMethod::Adaptive;
+    m_catamariConverter = std::make_unique<CatamariConverter>(*A_reduced, /* block_size = */ 1, m_legacy, m_entryForReducedEntry,
+                                                           retainFullPattern ? &fullPattern : nullptr);
 
     m_ldlControl->supernodal_control.relaxation_control.block_size = m_blockSize;
 
@@ -195,15 +200,21 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
         {
             ordering.inverse_permutation.Resize(A_reduced->m);
 
-            if (actualOrderingMethod == OrderingMethod::CholmodNesdis) {
-                auto iperm = m_cholmodOrdering.inversePermutation<catamari::Int>(*A_reduced, CholmodOrdering::Method::NestedDissection);
+            if (actualOrderingMethod == OrderingMethod::CholmodNesdis ||
+                actualOrderingMethod == OrderingMethod::CholmodNesdisParallel) {
+                CholmodOrdering::PreliminaryAssemblyForest<catamari::Int> forest;
+                auto method = actualOrderingMethod == OrderingMethod::CholmodNesdis
+                    ? CholmodOrdering::Method::NestedDissection : CholmodOrdering::Method::ParallelNestedDissection;
+                auto iperm = m_cholmodOrdering.inversePermutation<catamari::Int>(*A_reduced, method, &forest,
+                    actualOrderingMethod == OrderingMethod::CholmodNesdisParallel ? &fullPattern : nullptr);
                 Eigen::Map<VecX_T<catamari::Int>>(ordering.inverse_permutation.Data(), A_reduced->m) = iperm;
                 quotient::InvertPermutation(ordering.inverse_permutation, &ordering.permutation);
-            }
-            else if (actualOrderingMethod == OrderingMethod::CholmodNesdisParallel) {
-                auto iperm = m_cholmodOrdering.inversePermutation<catamari::Int>(*A_reduced, CholmodOrdering::Method::ParallelNestedDissection);
-                Eigen::Map<VecX_T<catamari::Int>>(ordering.inverse_permutation.Data(), A_reduced->m) = iperm;
-                quotient::InvertPermutation(ordering.inverse_permutation, &ordering.permutation);
+                ordering.supernode_sizes.Resize(forest.sizes.size());
+                std::copy(forest.sizes.begin(), forest.sizes.end(), ordering.supernode_sizes.begin());
+                OffsetScan(ordering.supernode_sizes, &ordering.supernode_offsets);
+                ordering.assembly_forest.parents.Resize(forest.parents.size());
+                std::copy(forest.parents.begin(), forest.parents.end(), ordering.assembly_forest.parents.begin());
+                ordering.assembly_forest.FillFromParents();
             }
             else if (actualOrderingMethod == OrderingMethod::Metis) {
                 auto iperm = m_cholmodOrdering.inversePermutation<catamari::Int>(*A_reduced, CholmodOrdering::Method::Metis);
@@ -394,6 +405,7 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
             else throw std::runtime_error("Unknown orderingMethod");
 
         }
+        fullPattern = {}; // Ordering is finished; release the temporary CSC indices.
         m_ldl->Factor(m_catamariConverter->get(), ordering, *m_ldlControl, /* symbolic_only = */ true);
 
         double sym_fact_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - sym_fact_start).count();
