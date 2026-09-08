@@ -12,10 +12,16 @@
 namespace MeshFEM {
 
 std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvider provider) {
+    return make_cholesky_factorizer(provider, false);
+}
+
+std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvider provider, bool singlePrecision) {
     switch (provider) {
         case CholeskyProvider::CHOLMOD:
+            if (singlePrecision) throw std::invalid_argument("CHOLMOD does not support singlePrecision");
             return std::make_unique<CholmodFactorizer>();
         case CholeskyProvider::PARDISO:
+            if (singlePrecision) throw std::invalid_argument("Pardiso does not support singlePrecision");
 #if MESHFEM_WITH_PARDISO || MESHFEM_WITH_MKL_PARDISO
             return std::make_unique<PardisoFactorizer>();
 #else
@@ -23,7 +29,7 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
 #endif
         case CholeskyProvider::Accelerate:
 #if __APPLE__
-            return std::make_unique<AccelerateFactorizer>();
+            return std::make_unique<AccelerateFactorizer>(singlePrecision);
 #else
             throw std::runtime_error("Compiled without Accelerate");
 #endif
@@ -38,7 +44,7 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
 #if MESHFEM_WITH_CATAMARI
             {
                 bool legacy = provider == CholeskyProvider::CatamariLegacy;
-                auto c = std::make_unique<CatamariFactorizer>(legacy);
+                auto c = std::make_unique<CatamariFactorizer>(legacy, singlePrecision);
                 // c->setUseLeftLooking(true);
                 if (provider == CholeskyProvider::Catamari)
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::Catamari;

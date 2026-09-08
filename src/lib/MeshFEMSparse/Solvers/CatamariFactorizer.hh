@@ -18,17 +18,24 @@
 #include "AdaptiveOrderingSelection.hh"
 
 namespace catamari {
+    struct SymmetricOrdering;
+
     template <typename Field>
     struct SparseLDLControl;
 
     template <typename Field>
+#ifdef MESHFEM_USE_LEGACY_CATAMARI
+    class SparseLDL;
+#else
     struct SparseLDL;
+#endif
 }
 
 namespace MeshFEM {
 
 // Forward declarations of Catamari types.
-struct CatamariConverter;
+template<class Field> struct CatamariConverterT;
+using CatamariConverter = CatamariConverterT<double>;
 
 struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
     enum class OrderingMethod {
@@ -37,6 +44,7 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
 
     // legacy: whether to use Jack Poulson's original implementation for comparison
     CatamariFactorizer(bool legacy = false);
+    CatamariFactorizer(bool legacy, bool singlePrecision);
 
     size_t m_reduced() const override;
     size_t n_reduced() const override;
@@ -69,9 +77,7 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
         factorizeNumeric(mat);
     }
 
-    void clearFactors() override {
-        m_factorizationType = FactorizationType::None;
-    }
+    void clearFactors() override;
 
     void solveMultiRHS(const Eigen::Matrix<Real, Eigen::Dynamic, Eigen::Dynamic> &B, Eigen::Matrix<Real, Eigen::Dynamic, Eigen::Dynamic> &X) const override;
 
@@ -179,15 +185,25 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
 #endif
 
 private:
-    template<typename... Args>
-    void m_numericFactorizationImpl(const double *Ax, Args&&... args);
-
     void m_factorizeSymbolic(const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars);
-
+#ifdef MESHFEM_USE_LEGACY_CATAMARI
+    template<typename... Args>
+    void m_numericFactorizationImpl(const SuiteSparseMatrix &A, Args&&... args);
     std::unique_ptr<catamari::SparseLDL<double>> m_ldl, m_ldlStash;
     std::unique_ptr<catamari::SparseLDLControl<double>> m_ldlControl;
-
     std::unique_ptr<CatamariConverter> m_catamariConverter;
+#else
+    template<class Field> struct State;
+    std::unique_ptr<State<double>> m_doubleState;
+    std::unique_ptr<State<float>> m_floatState;
+    template<class F> decltype(auto) m_withState(F &&f) const;
+    const catamari::SymmetricOrdering &m_ordering() const;
+    template<class Field>
+    void m_factorizeSymbolic(State<Field> &state, const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars);
+    template<class Field>
+    void m_numericFactorizationImpl(State<Field> &state, const SuiteSparseMatrix &A, Real sigma, const SuiteSparseMatrix *B);
+    void m_numericFactorizationImpl(const SuiteSparseMatrix &A, Real sigma = 0, const SuiteSparseMatrix *B = nullptr);
+#endif
 
     CholmodOrdering m_cholmodOrdering;
     size_t m_blockSize = 1;

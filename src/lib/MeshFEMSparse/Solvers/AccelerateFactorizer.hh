@@ -18,7 +18,7 @@ struct MESHFEM_EXPORT AccelerateFactorizer final : public CholeskyFactorizerBase
         Metis, AMD, Nesdis, CholmodAMD
     };
 
-    AccelerateFactorizer();
+    AccelerateFactorizer(bool singlePrecision = false);
 
     // *Scalar* size of the reduced system
     size_t m_reduced() const override { return static_cast<size_t>(m_reducedSizeScalar); }
@@ -79,6 +79,7 @@ struct MESHFEM_EXPORT AccelerateFactorizer final : public CholeskyFactorizerBase
     void clearFactors() override {
 #ifdef __APPLE__
         m_numfactor.reset();
+        m_numfactor_float.reset();
         m_symfactor.reset();
 #endif
     }
@@ -106,22 +107,33 @@ struct MESHFEM_EXPORT AccelerateFactorizer final : public CholeskyFactorizerBase
 
 private:
     // The row/col-removed matrix that is actually factorized.
-    SuiteSparseMatrix m_A_csc; // mirrors A_transpose role in Pardiso version
+    SuiteSparseMatrix m_A_csc; // sparsity pattern only
+
+    // Numerical values of row/col-removed matrix.
+    Eigen::VectorXd m_A_csc_values;
+    Eigen::VectorXf m_A_csc_values_float;
+
     Eigen::Matrix<int32_t, Eigen::Dynamic, 1> m_rowIndices_i32; // Accelerate uses int32_t for row/col indices.
 
     std::vector<SuiteSparse_long> m_sourceEntry; // source entry for each entry in `A_transpose`.
     std::vector<SuiteSparse_long> m_blockEntryForReducedBlockEntry;
 
+    const bool m_singlePrecision = false;
     int m_reducedSizeScalar = 0;
     bool m_useBlockAccel = true;
     size_t m_blockSize = 1;
 
-    void m_numericFactorizationImpl(const Real *Ax);
+    void m_numericFactorizationImpl(const void *Ax);
+    void m_numericFactorizationImpl() { // typical case: use the values stored in our members
+        if (m_singlePrecision) m_numericFactorizationImpl(m_A_csc_values_float.data());
+        else                   m_numericFactorizationImpl(m_A_csc_values      .data());
+    }
     void m_symbolicFactorizationImpl(const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars);
 
 #ifdef __APPLE__
     // Accelerate sparse objects
-    SparseMatrix_Double   m_sparseA; // structure + Ax
+    SparseMatrix_Double m_sparseA;
+    SparseMatrix_Float  m_sparseA_float;
 
     template<class FType>
     struct FactorizationWrapper {
@@ -160,12 +172,14 @@ private:
         ~FactorizationWrapper() { SparseCleanup(factor); }
     };
 
-    using SFWrap = FactorizationWrapper<SparseOpaqueSymbolicFactorization>;
-    using NFWrap = FactorizationWrapper<SparseOpaqueFactorization_Double>;
+    using SFWrap  = FactorizationWrapper<SparseOpaqueSymbolicFactorization>;
+    using NFWrapD = FactorizationWrapper<SparseOpaqueFactorization_Double>;
+    using NFWrapF = FactorizationWrapper<SparseOpaqueFactorization_Float>;
 
     // "Semi-opaque" symbolic and numeric factorization objects
-    std::unique_ptr<SFWrap> m_symfactor;
-    std::unique_ptr<NFWrap> m_numfactor;
+    std::unique_ptr<SFWrap > m_symfactor;
+    std::unique_ptr<NFWrapD> m_numfactor;
+    std::unique_ptr<NFWrapF> m_numfactor_float;
 
     // Control options
     SparseSymbolicFactorOptions m_opts;

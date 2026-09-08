@@ -33,8 +33,9 @@ SuiteSparseMatrix expandSparsityPattern(const SuiteSparseMatrix &A, size_t block
 // matrix's lower triangle. To prevent looking up these locations in each of
 // the many conversions done with a fixed sparsity pattern, we cache their
 // entry pointers in a lookup table.
-struct CatamariConverter {
-    using CMat = catamari::CoordinateMatrix<double>;
+template<class Field>
+struct CatamariConverterT {
+    using CMat = catamari::CoordinateMatrix<Field>;
 
     // Note `Asp_in` is the rowcol-reduced *block* sparsity pattern.
     // If `blockSize > 1`, then `Asp_in` will be expanded from a "block sparsity
@@ -43,8 +44,8 @@ struct CatamariConverter {
     // the caller should pass `blockSize = 1` and interpret the converter's
     // entries as representing blocks of the appropriate size.
     // Optionally transfer the full sparsity-only CSC to the ordering caller.
-    CatamariConverter(const SuiteSparseMatrix &Asp_in, const size_t blockSize, bool legacy, const std::vector<SuiteSparse_long> &entryForReducedEntry,
-                     CSCMatrix<SuiteSparse_long, SuiteSparse_long> *fullPattern = nullptr)
+    CatamariConverterT(const SuiteSparseMatrix &Asp_in, const size_t blockSize, bool legacy, const std::vector<SuiteSparse_long> &entryForReducedEntry,
+                      CSCMatrix<SuiteSparse_long, SuiteSparse_long> *fullPattern = nullptr)
         : m_legacy(legacy)
     {
 #ifdef MESHFEM_USE_LEGACY_CATAMARI
@@ -80,7 +81,7 @@ struct CatamariConverter {
                 A_full = Asp_ptr->toSymmetryModeImpl<SuiteSparse_long>(SuiteSparseMatrix::SymmetryMode::NONE, [](size_t ii) { return ii; });
             }
 
-            catamari::Buffer<catamari::MatrixEntry<typename SuiteSparseMatrix::value_type>> new_entries;
+            catamari::Buffer<catamari::MatrixEntry<Field>> new_entries;
             {
                 BENCHMARK_SCOPED_TIMER_SECTION t2("Entry Generation");
                 new_entries.Resize(A_full.nz);
@@ -89,7 +90,9 @@ struct CatamariConverter {
                         SuiteSparse_long i = A_full.Ai[ii];
                         new_entries[ii].row = j; // transpose: Catamari uses CSR storage
                         new_entries[ii].column = i;
-                        // new_entries[ii].value = 1; // Value won't be referenced...
+                        // Legacy Factor also performs a numeric pass; give it a
+                        // valid identity matrix while constructing the symbolic factor.
+                        if (legacy) new_entries[ii].value = (i == j) ? Field(1) : Field(0);
                     }
                 }, /* grain_size = */ 64, /* parallelism_threshold = */ 128);
             }
@@ -223,6 +226,8 @@ private:
     SuiteSparseMatrix m_Asp; // For legacy mode only
     VecX_T<catamari::Int> m_sourceLocForCatamariInputEntry; // For legacy mode only
 };
+
+using CatamariConverter = CatamariConverterT<double>;
 
 } // namespace MeshFEM
 

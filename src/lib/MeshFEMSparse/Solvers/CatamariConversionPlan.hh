@@ -18,8 +18,6 @@ namespace MeshFEM {
 
 namespace catamari_conversion_plan {
 
-using CMat = catamari::CoordinateMatrix<double>;
-using LDL = catamari::SparseLDL<double>;
 using ConversionPlan = catamari::ConversionPlan;
 using Int = catamari::Int;
 
@@ -35,7 +33,8 @@ using Int = catamari::Int;
 //          account for possible value array permutation caused by the original
 //          matrix begin evaluated in a block format with different storage
 //          layout (e.g., the `ContiguousBlocks` case of `BlockCSCHessian`).
-ConversionPlan constructConversionPlan(const CMat &A_rowcolreduced_full, const LDL &ldl, const std::vector<SuiteSparse_long> &srcReducedEntryForFullMatrixEntry, const std::vector<SuiteSparse_long> &entryForReducedEntry, const VecX_T<SuiteSparse_long> &dataOffsetForScalarHessianLoc) {
+template<class Field>
+ConversionPlan constructConversionPlan(const catamari::CoordinateMatrix<Field> &A_rowcolreduced_full, const catamari::SparseLDL<Field> &ldl, const std::vector<SuiteSparse_long> &srcReducedEntryForFullMatrixEntry, const std::vector<SuiteSparse_long> &entryForReducedEntry, const VecX_T<SuiteSparse_long> &dataOffsetForScalarHessianLoc) {
     BENCHMARK_SCOPED_TIMER_SECTION ctimer("constructConversionPlan");
     auto f = ldl.supernodal_factorization.get();
     if (f == nullptr) throw std::runtime_error("Only supernodal factorizations are supported");
@@ -45,7 +44,7 @@ ConversionPlan constructConversionPlan(const CMat &A_rowcolreduced_full, const L
 
     auto &o  = f->ordering_;
     auto &sno = o.supernode_offsets;
-    const double *f_vals = f->factor_values_.Data();
+    const Field *f_vals = f->factor_values_.Data();
     const Int num_supernodes = o.supernode_sizes.Size();
     if (o.permutation.Empty()) throw std::runtime_error("Expected permutation");
 
@@ -97,8 +96,8 @@ ConversionPlan constructConversionPlan(const CMat &A_rowcolreduced_full, const L
         for (Int supernode = r.begin(); supernode < r.end(); ++supernode) {
             const Int supernode_start = sno[supernode    ];
             const Int supernode_end   = sno[supernode + 1];
-            catamari::BlasMatrixView<double>& db = df->blocks[supernode];
-            catamari::BlasMatrixView<double>& lb = lf->blocks[supernode];
+            catamari::BlasMatrixView<Field>& db = df->blocks[supernode];
+            catamari::BlasMatrixView<Field>& lb = lf->blocks[supernode];
             const Int *index_beg = lf->StructureBeg(supernode);
             const Int *index_end = lf->StructureEnd(supernode);
 
@@ -111,7 +110,7 @@ ConversionPlan constructConversionPlan(const CMat &A_rowcolreduced_full, const L
                 const Int col_entries_end   = A_rowcolreduced_full.RowEntryOffset(j_orig + 1);
                 const Int *guess = nullptr;
                 for (Int ii = col_entries_begin; ii < col_entries_end; ++ii) {
-                    const catamari::MatrixEntry<double> &e = A_rowcolreduced_full.Entry(ii);
+                    const catamari::MatrixEntry<Field> &e = A_rowcolreduced_full.Entry(ii);
                     Int i_perm = o.permutation[e.column];
                     if (i_perm < j_perm) continue; // Skip the strict upper triangle.
 
@@ -121,7 +120,7 @@ ConversionPlan constructConversionPlan(const CMat &A_rowcolreduced_full, const L
                     const Int j_rel = j_perm - supernode_start;
                     if (i_perm < supernode_end) {
                         const Int i_rel = i_perm - supernode_start;
-                        locForEntry = std::distance(f_vals, (const double *) db.Pointer(i_rel, j_rel));
+                        locForEntry = std::distance(f_vals, (const Field *) db.Pointer(i_rel, j_rel));
                     }
                     else {
                         // Search [lf->structureBeg, lf->structureEnd) for value `i_perm`,
@@ -136,7 +135,7 @@ ConversionPlan constructConversionPlan(const CMat &A_rowcolreduced_full, const L
                         guess = iter + 1;
 
                         const Int i_rel = std::distance(index_beg, iter);
-                        locForEntry = std::distance(f_vals, (const double *) lb.Pointer(i_rel, j_rel));
+                        locForEntry = std::distance(f_vals, (const Field *) lb.Pointer(i_rel, j_rel));
                     }
 
                     // Record which source entry should be read for `locForEntry`
@@ -167,11 +166,12 @@ ConversionPlan constructConversionPlan(const CMat &A_rowcolreduced_full, const L
 // to the corresponding nonzero entry the pre-row-col-reduced block matrix.
 //
 // TODO: try to simplify this... :(
-ConversionPlan constructScalarConversionPlan(const CMat &A_rowcolreduced_full_block,
+template<class Field>
+ConversionPlan constructScalarConversionPlan(const catamari::CoordinateMatrix<Field> &A_rowcolreduced_full_block,
                    const SuiteSparseMatrix &A_nonreduced_block,
                    const std::vector<SuiteSparse_long> &reducedRowForRow_block,
                    const catamari::Int block_size,
-                   const LDL &ldl_scalar, const LDL &ldl_block,
+                   const catamari::SparseLDL<Field> &ldl_scalar, const catamari::SparseLDL<Field> &ldl_block,
                    const std::vector<SuiteSparse_long> &srcReducedEntryForFullMatrixEntry_block,
                    const std::vector<SuiteSparse_long> &entryForReducedEntry_block) {
     BENCHMARK_SCOPED_TIMER_SECTION ctimer("constructScalarConversionPlan");
@@ -186,7 +186,7 @@ ConversionPlan constructScalarConversionPlan(const CMat &A_rowcolreduced_full_bl
 
     auto &o  = f->ordering_;
     auto &sno = o.supernode_offsets;
-    const double *f_vals_scalar = f_scalar->factor_values_.Data();
+    const Field *f_vals_scalar = f_scalar->factor_values_.Data();
     const Int num_supernodes = o.supernode_sizes.Size();
     if (o.permutation.Empty()) throw std::runtime_error("Expected permutation");
 
@@ -263,8 +263,8 @@ ConversionPlan constructScalarConversionPlan(const CMat &A_rowcolreduced_full_bl
         for (Int supernode = r.begin(); supernode < r.end(); ++supernode) {
             const Int supernode_start = sno[supernode    ];
             const Int supernode_end   = sno[supernode + 1];
-            const catamari::BlasMatrixView<double>& db_scalar = df_scalar->blocks[supernode];
-            const catamari::BlasMatrixView<double>& lb_scalar = lf_scalar->blocks[supernode];
+            const catamari::BlasMatrixView<Field>& db_scalar = df_scalar->blocks[supernode];
+            const catamari::BlasMatrixView<Field>& lb_scalar = lf_scalar->blocks[supernode];
             const Int *index_beg = lf->StructureBeg(supernode);
             const Int *index_end = lf->StructureEnd(supernode);
 
@@ -276,7 +276,7 @@ ConversionPlan constructScalarConversionPlan(const CMat &A_rowcolreduced_full_bl
                 const Int col_entries_end   = A_rowcolreduced_full_block.RowEntryOffset(j_orig + 1);
                 const Int *guess = nullptr;
                 for (Int ii = col_entries_begin; ii < col_entries_end; ++ii) {
-                    const catamari::MatrixEntry<double> &e = A_rowcolreduced_full_block.Entry(ii);
+                    const catamari::MatrixEntry<Field> &e = A_rowcolreduced_full_block.Entry(ii);
                     const Int i_orig = e.column;
                     Int i_perm = o.permutation[i_orig];
                     if (i_perm < j_perm) continue; // Skip the strict upper triangle.
@@ -289,7 +289,7 @@ ConversionPlan constructScalarConversionPlan(const CMat &A_rowcolreduced_full_bl
                     if (i_perm < supernode_end) {
                         i_rel = i_perm - supernode_start;
                         // Look up corresponding location in scalar factor
-                        locForEntry = std::distance(f_vals_scalar, (const double *) db_scalar.Pointer(block_size * i_rel, block_size * j_rel));
+                        locForEntry = std::distance(f_vals_scalar, (const Field *) db_scalar.Pointer(block_size * i_rel, block_size * j_rel));
                     }
                     else {
                         // Search [lf->structureBeg, lf->structureEnd) for value `i_perm`,
@@ -304,7 +304,7 @@ ConversionPlan constructScalarConversionPlan(const CMat &A_rowcolreduced_full_bl
                         guess = iter + 1;
 
                         i_rel = std::distance(index_beg, iter);
-                        locForEntry = std::distance(f_vals_scalar, (const double *) lb_scalar.Pointer(block_size * i_rel, block_size * j_rel));
+                        locForEntry = std::distance(f_vals_scalar, (const Field *) lb_scalar.Pointer(block_size * i_rel, block_size * j_rel));
                     }
 
                     // Determine the location of the uppper-left entry of
@@ -396,8 +396,9 @@ ConversionPlan constructScalarConversionPlan(const CMat &A_rowcolreduced_full_bl
 // Currently the plan is for injecting entries into the expanded factorization
 // `ldl_scalar`, but we intend eventually to avoid the expansion step and
 // work directly with `ldl_block`.
-ConversionPlan constructBlockConversionPlan(const CMat &A_rowcolreduced_full_block, catamari::Int block_size,
-                                            const LDL &ldl_scalar, const LDL &ldl_block,
+template<class Field>
+ConversionPlan constructBlockConversionPlan(const catamari::CoordinateMatrix<Field> &A_rowcolreduced_full_block, catamari::Int block_size,
+                                            const catamari::SparseLDL<Field> &ldl_scalar, const catamari::SparseLDL<Field> &ldl_block,
                                             const std::vector<SuiteSparse_long> &srcReducedEntryForFullMatrixEntry_block,
                                             const std::vector<SuiteSparse_long> &entryForReducedEntry_block) {
     BENCHMARK_SCOPED_TIMER_SECTION ctimer("constructBlockConversionPlan");
@@ -412,7 +413,7 @@ ConversionPlan constructBlockConversionPlan(const CMat &A_rowcolreduced_full_blo
 
     auto &o  = f->ordering_;
     auto &sno = o.supernode_offsets;
-    const double *f_vals_scalar = f_scalar->factor_values_.Data();
+    const Field *f_vals_scalar = f_scalar->factor_values_.Data();
     const Int num_supernodes = o.supernode_sizes.Size();
     if (o.permutation.Empty()) throw std::runtime_error("Expected permutation");
 
@@ -481,8 +482,8 @@ ConversionPlan constructBlockConversionPlan(const CMat &A_rowcolreduced_full_blo
         for (Int supernode = s_start; supernode < s_end; ++supernode) {
             const Int supernode_start = sno[supernode    ];
             const Int supernode_end   = sno[supernode + 1];
-            const catamari::BlasMatrixView<double>& db_scalar = df_scalar->blocks[supernode];
-            const catamari::BlasMatrixView<double>& lb_scalar = lf_scalar->blocks[supernode];
+            const catamari::BlasMatrixView<Field>& db_scalar = df_scalar->blocks[supernode];
+            const catamari::BlasMatrixView<Field>& lb_scalar = lf_scalar->blocks[supernode];
             const Int *index_beg = lf->StructureBeg(supernode);
             const Int *index_end = lf->StructureEnd(supernode);
 
@@ -505,13 +506,13 @@ ConversionPlan constructBlockConversionPlan(const CMat &A_rowcolreduced_full_blo
                     if (i_perm < supernode_end) {
                         i_rel = i_perm - supernode_start;
                         // Look up corresponding location in scalar factor
-                        locForEntry = std::distance(f_vals_scalar, (const double *) db_scalar.Pointer(block_size * i_rel, block_size * j_rel));
+                        locForEntry = std::distance(f_vals_scalar, (const Field *) db_scalar.Pointer(block_size * i_rel, block_size * j_rel));
                     }
                     else {
                         // Search [lf->structureBeg, lf->structureEnd) for value `i_perm`
                         const Int *iter = sb_lower_bound(index_beg, index_end, i_perm);
                         i_rel = std::distance(index_beg, iter);
-                        locForEntry = std::distance(f_vals_scalar, (const double *) lb_scalar.Pointer(block_size * i_rel, block_size * j_rel));
+                        locForEntry = std::distance(f_vals_scalar, (const Field *) lb_scalar.Pointer(block_size * i_rel, block_size * j_rel));
                     }
 
                     // Record which source entry should be read for `locForEntry`
@@ -537,13 +538,14 @@ ConversionPlan constructBlockConversionPlan(const CMat &A_rowcolreduced_full_blo
 }
 
 // A_scalar should be nonreduced!
-void validate(const catamari::ConversionPlan &cplan, const catamari::SparseLDL<double> &ldl_scalar, const SuiteSparseMatrix &A_scalar, const std::vector<SuiteSparse_long> &reducedRowForRow_scalar, size_t numReducedRows) {
+template<class Field>
+void validate(const catamari::ConversionPlan &cplan, const catamari::SparseLDL<Field> &ldl_scalar, const SuiteSparseMatrix &A_scalar, const std::vector<SuiteSparse_long> &reducedRowForRow_scalar, size_t numReducedRows) {
     if (cplan.columnOffsets.size() != Int(numReducedRows + 1))
         throw std::runtime_error("Invalid conversion plan: column offsets size mismatch: " + std::to_string(cplan.columnOffsets.size()) + " != " + std::to_string(numReducedRows + 1));
     const auto &f = *(ldl_scalar.supernodal_factorization);
     const auto &lf = f.lower_factor_;
     const auto &df = f.diagonal_factor_;
-    const double *f_vals = f.factor_values_.Data();
+    const Field *f_vals = f.factor_values_.Data();
 
     std::vector<bool> seen(cplan.size(), false);
 
@@ -575,7 +577,7 @@ void validate(const catamari::ConversionPlan &cplan, const catamari::SparseLDL<d
         if (i_perm < so + ss) {
             Int i_rel = i_perm - so;
             // diagonal block
-            dst = std::distance(f_vals, (const double *) df->blocks[s].Pointer(i_rel, j_rel));
+            dst = std::distance(f_vals, (const Field *) df->blocks[s].Pointer(i_rel, j_rel));
         }
         else {
             // lower factor
@@ -586,7 +588,7 @@ void validate(const catamari::ConversionPlan &cplan, const catamari::SparseLDL<d
 
             Int i_rel = std::distance(index_beg, iter);
             assert(i_rel < lb.LeadingDimension());
-            dst = std::distance(f_vals, (const double *) lb.Pointer(i_rel, j_rel));
+            dst = std::distance(f_vals, (const Field *) lb.Pointer(i_rel, j_rel));
         }
 
         auto ebegin = cplan.columnData(j_perm);

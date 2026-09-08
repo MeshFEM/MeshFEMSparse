@@ -2,6 +2,9 @@ add_executable(MeshFEMSparse_unit_tests
     main.cc
     test_sparse_matrices.cc
     test_block_csc_hessian.cc
+    test_accelerate_factorizer.cc
+    test_catamari_solve_kernels.cc
+    test_catamari_factorizer.cc
 )
 
 target_link_libraries(MeshFEMSparse_unit_tests PUBLIC

@@ -29,14 +29,17 @@
 
 namespace MeshFEM {
 
-CatamariFactorizer::CatamariFactorizer(bool legacy) {
+CatamariFactorizer::CatamariFactorizer(bool legacy) : CatamariFactorizer(legacy, false) { }
+
+CatamariFactorizer::CatamariFactorizer(bool legacy, bool singlePrecision) {
+    if (singlePrecision) throw std::invalid_argument("Single precision is unavailable for legacy Catamari");
+    m_legacy = true;
     m_ldl        = std::make_unique<catamari::SparseLDL<double>>();
     m_ldlControl = std::make_unique<catamari::SparseLDLControl<double>>();
     m_ldlControl->SetFactorizationType(catamari::kCholeskyFactorization);
     m_ldlControl->supernodal_strategy = catamari::kSupernodalFactorization;
     m_ldlControl->supernodal_control.algorithm = catamari::kRightLookingLDL; // catamari::kRightLookingLDL;
     m_ldlControl->supernodal_control.relaxation_control.relax_supernodes = true;
-    m_ldlControl->supernodal_control.parallel_ratio_threshold = 0.02;
     // m_ldlControl->supernodal_control.factor_tile_size = std::numeric_limits<catamari::Int>::max(); // Effectively disable node-level parallelism
 }
 
@@ -88,12 +91,8 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
 
     if (orderingMethod == OrderingMethod::Catamari)
         m_ldl->Factor(m_catamariConverter->get(), *m_ldlControl);
-    else if ((orderingMethod == OrderingMethod::CholmodNesdis) || (orderingMethod == OrderingMethod::Metis)
+    else if ((orderingMethod == OrderingMethod::CholmodNesdis) || (orderingMethod == OrderingMethod::CholmodNesdisParallel) || (orderingMethod == OrderingMethod::Metis)
           || (orderingMethod == OrderingMethod::AMD) || (orderingMethod == OrderingMethod::Adaptive)) {
-        if (!m_c) {
-            m_c = std::make_unique<cholmod_common>();
-            cholmod_l_start(m_c.get());
-        }
 
         OrderingMethod actualOrderingMethod = orderingMethod;
         if (orderingMethod == OrderingMethod::Adaptive) {
@@ -110,82 +109,14 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
         catamari::SymmetricOrdering ordering;
         {
             ordering.inverse_permutation.Resize(A_reduced->m);
-            auto cholmat = cholmod_sparse_view(*A_reduced);
-            // Note: the array `cholmat.x` apparently must be valid or cholmod_l_nested_dissection fails
-            // (even though the Nested dissection algorithm should not be
-            // looking at its entries...)
-            // Presumably this is because the first step of cholmod_l_nested_dissection
-            // is to convert the matrix from upper-triangular to full format.
-            // In the future, we should bypass this step since we already do the
-            // conversion ourselves for Catamari.
-            cholmat.x = dummy_values_ptr(A_reduced->Ai.data(), A_reduced->Ai.size(), m_valuesDummy);
-
-            if (actualOrderingMethod == OrderingMethod::CholmodNesdis) {
-#if QUOTIENT_USE_64BIT
-#if 0 // Whether to downcast for ordering -- the difference in time seems negligible
-                if (!m_c_int) {
-                    m_c_int = std::make_unique<cholmod_common>();
-                    cholmod_start(m_c_int.get());
-                }
-
-                BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_nesdis");
-                VecX_T<int> Ai_downcast, Ap_downcast, iperm_downcast;
-
-                Ai_downcast = Eigen::Map<const VecX_T<SuiteSparse_long>>(A_reduced->Ai.data(), A_reduced->Ai.size()).template cast<int>();
-                Ap_downcast = Eigen::Map<const VecX_T<SuiteSparse_long>>(A_reduced->Ap.data(), A_reduced->Ap.size()).template cast<int>();
-                auto cholmat_downcast = cholmod_sparse_view(A_reduced->m, A_reduced->n, A_reduced->nz, cholmat.x,
-                                                            Ai_downcast.data(), Ap_downcast.data());
-                iperm_downcast.resize(A_reduced->m);
-                catamari::Buffer<int> CParent(A_reduced->m), CMember(A_reduced->m);
-                cholmod_nested_dissection(&cholmat_downcast, /* fset = */ nullptr, /* fsize = */ 0,
-                                            iperm_downcast.data(), (int *) CParent.Data(), (int *) CMember.Data(), m_c_int.get());
-                Eigen::Map<VecX_T<catamari::Int>>(ordering.inverse_permutation.Data(), A_reduced->m) = iperm_downcast.template cast<catamari::Int>();
-#else
-                BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_l_nested_dissection");
-                catamari::Buffer<SuiteSparse_long> CParent(A_reduced->m), CMember(A_reduced->m);
-                cholmod_l_nested_dissection(&cholmat, /* fset = */ nullptr, /* fsize = */ 0,
-                                            (SuiteSparse_long *) ordering.inverse_permutation.Data(),
-                                            CParent.Data(), CMember.Data(), m_c.get());
-#endif
-#else // !QUOTIENT_USE_64BIT
-                BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_nested_dissection");
-                if (!m_c_int) {
-                    m_c_int = std::make_unique<cholmod_common>();
-                    cholmod_start(m_c_int.get());
-                }
-
-                // TODO: remove this when we make the BlockCSCHessian/assembly index type configurable match catamari::Int.
-                VecX_T<int> Ai_downcast = Eigen::Map<const VecX_T<std::decay_t<decltype(A_reduced->Ai[0])>>>(A_reduced->Ai.data(), A_reduced->Ai.size()).template cast<int>();
-                VecX_T<int> Ap_downcast = Eigen::Map<const VecX_T<std::decay_t<decltype(A_reduced->Ap[0])>>>(A_reduced->Ap.data(), A_reduced->Ap.size()).template cast<int>();
-                auto cholmat_downcast = cholmod_sparse_view(A_reduced->m, A_reduced->n, A_reduced->nz, cholmat.x,
-                                                            Ai_downcast.data(), Ap_downcast.data());
-                static_assert(std::is_same_v<catamari::Int, int>, "catamari::Int must be `int` here");
-                catamari::Buffer<Int> CParent(A_reduced->m), CMember(A_reduced->m);
-                cholmod_nested_dissection(&cholmat_downcast, /* fset = */ nullptr, /* fsize = */ 0,
-                                          ordering.inverse_permutation.Data(), CParent.Data(), CMember.Data(), m_c_int.get());
-
-#endif
-                quotient::InvertPermutation(ordering.inverse_permutation, &ordering.permutation);
-            }
-            else if (actualOrderingMethod == OrderingMethod::Metis) {
-#if QUOTIENT_USE_64BIT
-                BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_l_metis");
-                cholmod_l_metis(&cholmat, /* fset = */ nullptr, /* fsize = */ 0, /* postorder = */ true,
-                                (SuiteSparse_long *) ordering.inverse_permutation.Data(), m_c.get());
-#else
-                BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_metis");
-                if (!m_c_int) {
-                    m_c_int = std::make_unique<cholmod_common>();
-                    cholmod_start(m_c_int.get());
-                }
-
-                VecX_T<int> Ai_downcast = Eigen::Map<const VecX_T<std::decay_t<decltype(A_reduced->Ai[0])>>>(A_reduced->Ai.data(), A_reduced->Ai.size()).template cast<int>();
-                VecX_T<int> Ap_downcast = Eigen::Map<const VecX_T<std::decay_t<decltype(A_reduced->Ap[0])>>>(A_reduced->Ap.data(), A_reduced->Ap.size()).template cast<int>();
-                auto cholmat_downcast = cholmod_sparse_view(A_reduced->m, A_reduced->n, A_reduced->nz, cholmat.x,
-                                                            Ai_downcast.data(), Ap_downcast.data());
-                cholmod_metis(&cholmat_downcast, /* fset = */ nullptr, /* fsize = */ 0, /* postorder = */ true,
-                              ordering.inverse_permutation.Data(), m_c_int.get());
-#endif
+            if ((actualOrderingMethod == OrderingMethod::CholmodNesdis) ||
+                (actualOrderingMethod == OrderingMethod::CholmodNesdisParallel) ||
+                (actualOrderingMethod == OrderingMethod::Metis)) {
+                auto method = actualOrderingMethod == OrderingMethod::Metis ? CholmodOrdering::Method::Metis :
+                    actualOrderingMethod == OrderingMethod::CholmodNesdisParallel ? CholmodOrdering::Method::ParallelNestedDissection :
+                    CholmodOrdering::Method::NestedDissection;
+                auto iperm = m_cholmodOrdering.inversePermutation<catamari::Int>(*A_reduced, method);
+                std::copy(iperm.data(), iperm.data() + iperm.size(), ordering.inverse_permutation.Data());
                 quotient::InvertPermutation(ordering.inverse_permutation, &ordering.permutation);
             }
             else if (actualOrderingMethod == OrderingMethod::AMD) {
@@ -367,7 +298,6 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
             }
             else throw std::runtime_error("Unknown orderingMethod");
 
-            m_valuesDummy.resize(0);
         }
 
         {
@@ -524,9 +454,8 @@ bool CatamariFactorizer::  hasStashedFactorization() const { return bool(m_ldlSt
 void CatamariFactorizer:: swapStashedFactorization()       { if (!hasStashedFactorization()) { throw std::runtime_error("No stashed factorization"); } std::swap(m_ldl, m_ldlStash); }
 void CatamariFactorizer::clearStashedFactorization()       { m_ldlStash.reset(); }
 
-CatamariFactorizer::~CatamariFactorizer() {
-    if (m_c) cholmod_l_finish(m_c.get());
-    if (m_c_int) cholmod_finish(m_c_int.get());
-}
+void CatamariFactorizer::clearFactors() { m_factorizationType = FactorizationType::None; }
+
+CatamariFactorizer::~CatamariFactorizer() = default;
 
 } // namespace MeshFEM

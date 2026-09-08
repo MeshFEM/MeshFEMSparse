@@ -4,7 +4,9 @@ namespace MeshFEM {
 
 #if __APPLE__
 
-AccelerateFactorizer::AccelerateFactorizer() {
+AccelerateFactorizer::AccelerateFactorizer(bool singlePrecision)
+    : m_singlePrecision(singlePrecision)
+{
     m_opts.control = SparseDefaultControl;
     m_opts.orderMethod = SparseOrderMetis;
     m_opts.order                = nullptr;
@@ -22,7 +24,6 @@ void AccelerateFactorizer::ensureApple() const { }
 void AccelerateFactorizer::m_setUpperTriangleCSC(const SuiteSparseMatrix &A_reduced) {
     const auto &Lsp = A_reduced;
 
-
     m_A_csc.symmetry_mode = SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE;
     m_A_csc.Ap = Lsp.Ap; // std::move(Lsp.Ap);
     // Accelerate uses int32_t row indices...
@@ -32,21 +33,22 @@ void AccelerateFactorizer::m_setUpperTriangleCSC(const SuiteSparseMatrix &A_redu
     m_A_csc.m = Lsp.m;
     m_A_csc.n = Lsp.n;
     m_A_csc.nz = Lsp.nz;
-    m_A_csc.Ax.resize(Lsp.nz * m_blockSize * m_blockSize);
 
-    m_sparseA.data = m_A_csc.Ax.data();
-    auto &s = m_sparseA.structure;
-    s.rowCount     = static_cast<int>(m_A_csc.m);
-    s.columnCount  = static_cast<int>(m_A_csc.n);
-    s.columnStarts = reinterpret_cast<long *>(m_A_csc.Ap.data()); // TODO: remove this hack (CSCMatrix should use `long` rather than the same-sized `long long`)
-    s.rowIndices   = m_rowIndices_i32.data();
-    s.blockSize    = static_cast<uint8_t>(m_blockSize);
+    SparseMatrixStructure *s = nullptr;
+    if (m_singlePrecision) { m_A_csc_values_float.resize(Lsp.nz * m_blockSize * m_blockSize); m_sparseA_float.data = m_A_csc_values_float.data(); s = &m_sparseA_float.structure; }
+    else                   { m_A_csc_values      .resize(Lsp.nz * m_blockSize * m_blockSize); m_sparseA      .data = m_A_csc_values      .data(); s = &m_sparseA      .structure; }
 
-    s.attributes.transpose          = 0;
-    s.attributes.triangle           = SparseUpperTriangle;
-    s.attributes.kind               = SparseSymmetric;
-    s.attributes._reserved          = 0;
-    s.attributes._allocatedBySparse = false;
+    s->rowCount     = static_cast<int>(m_A_csc.m);
+    s->columnCount  = static_cast<int>(m_A_csc.n);
+    s->columnStarts = reinterpret_cast<long *>(m_A_csc.Ap.data()); // TODO: remove this hack (CSCMatrix should use `long` rather than the same-sized `long long`)
+    s->rowIndices   = m_rowIndices_i32.data();
+    s->blockSize    = static_cast<uint8_t>(m_blockSize);
+
+    s->attributes.transpose          = 0;
+    s->attributes.triangle           = SparseUpperTriangle;
+    s->attributes.kind               = SparseSymmetric;
+    s->attributes._reserved          = 0;
+    s->attributes._allocatedBySparse = false;
 }
 
 void AccelerateFactorizer::factorizeSymbolic(const BlockCSCHessianBase &mat, const std::vector<size_t> &pinnedVars) {
@@ -181,19 +183,27 @@ void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &
     BENCHMARK_SCOPED_TIMER_SECTION sftimer("SparseFactor Call");
 
     m_numfactor.reset();
+    m_numfactor_float.reset();
     m_symfactor.reset();
-    m_symfactor = std::make_unique<SFWrap>(SparseFactorizationCholesky, m_sparseA.structure, m_opts); // throws on failure!
+    const auto &structure = m_singlePrecision ? m_sparseA_float.structure : m_sparseA.structure;
+    m_symfactor = std::make_unique<SFWrap>(SparseFactorizationCholesky, structure, m_opts); // throws on failure!
     m_factorizationType = FactorizationType::Symbolic;
 }
 
-void AccelerateFactorizer::m_numericFactorizationImpl(const Real *Ax) {
+void AccelerateFactorizer::m_numericFactorizationImpl(const void *Ax) {
     assertFactorization(FactorizationType::Symbolic);
 
     BENCHMARK_SCOPED_TIMER_SECTION timer("Accelerate SparseFactor Numeric Call");
-    m_sparseA.data = const_cast<Real *>(Ax);
-    // Re-factor numerically using the existing symbolic factorization.
-    m_numfactor.reset();
-    m_numfactor = std::make_unique<NFWrap>(m_symfactor->factor, m_sparseA); // throws on failure!
+    if (m_singlePrecision) {
+        m_sparseA_float.data = const_cast<float *>((const float *)(Ax));
+        m_numfactor_float.reset();
+        m_numfactor_float = std::make_unique<NFWrapF>(m_symfactor->factor, m_sparseA_float); // throws on failure!
+    }
+    else {
+        m_sparseA.data = const_cast<double *>((const double *)(Ax));
+        m_numfactor.reset();
+        m_numfactor = std::make_unique<NFWrapD>(m_symfactor->factor, m_sparseA); // throws on failure!
+    }
     m_factorizationType = FactorizationType::Numeric;
 }
 
@@ -211,11 +221,21 @@ void AccelerateFactorizer::setValuesFromSource(const SuiteSparseMatrix &A, Real 
                 if (m_blockEntryForReducedBlockEntry.size()) src_loc = m_blockEntryForReducedBlockEntry[ii];
                 if (m_dataOffsetForScalarHessianLoc.size())  src_loc = m_dataOffsetForScalarHessianLoc[src_loc];
 
-                if (m_blockSize == 1) m_A_csc.Ax[ii] = A.Ax[src_loc];
+                if (m_singlePrecision) {
+                    if (m_blockSize == 1) m_A_csc_values_float[ii] = static_cast<float>(A.Ax[src_loc]);
+                    else {
+                        Eigen::Map<Eigen::MatrixXf> dst_block(m_A_csc_values_float.data() + ii * m_blockSize * m_blockSize, m_blockSize, m_blockSize);
+                        Eigen::Map<const Eigen::MatrixXd> src_block(A.Ax.data() + src_loc * m_blockSize * m_blockSize, m_blockSize, m_blockSize);
+                        dst_block = src_block.cast<float>();
+                    }
+                }
                 else {
-                    Eigen::Map<Eigen::MatrixXd> dst_block(m_A_csc.Ax.data() + ii * m_blockSize * m_blockSize, m_blockSize, m_blockSize);
-                    Eigen::Map<const Eigen::MatrixXd> src_block(A.Ax.data() + src_loc * m_blockSize * m_blockSize, m_blockSize, m_blockSize);
-                    dst_block = src_block;
+                    if (m_blockSize == 1) m_A_csc_values[ii] = A.Ax[src_loc];
+                    else {
+                        Eigen::Map<Eigen::MatrixXd> dst_block(m_A_csc_values.data() + ii * m_blockSize * m_blockSize, m_blockSize, m_blockSize);
+                        Eigen::Map<const Eigen::MatrixXd> src_block(A.Ax.data() + src_loc * m_blockSize * m_blockSize, m_blockSize, m_blockSize);
+                        dst_block = src_block;
+                    }
                 }
             }
         });
@@ -225,8 +245,14 @@ void AccelerateFactorizer::setValuesFromSource(const SuiteSparseMatrix &A, Real 
             auto diag_block_loc = m_A_csc.Ap[j + 1] - 1;
             assert(m_rowIndices_i32[diag_block_loc] == j);
             auto diag_scalar_loc = diag_block_loc * m_blockSize * m_blockSize;
-            Eigen::Map<Eigen::MatrixXd> diag_block(m_A_csc.Ax.data() + diag_scalar_loc, m_blockSize, m_blockSize);
-            diag_block.diagonal().array() += sigma;
+            if (m_singlePrecision) {
+                Eigen::Map<Eigen::MatrixXf> diag_block(m_A_csc_values_float.data() + diag_scalar_loc, m_blockSize, m_blockSize);
+                diag_block.diagonal().array() += static_cast<float>(sigma);
+            }
+            else {
+                Eigen::Map<Eigen::MatrixXd> diag_block(m_A_csc_values.data() + diag_scalar_loc, m_blockSize, m_blockSize);
+                diag_block.diagonal().array() += sigma;
+            }
         }
     }
 }
@@ -239,9 +265,15 @@ void AccelerateFactorizer::factorizeNumeric(const SuiteSparseMatrix &A, bool) {
         throw std::runtime_error("Inconsistent state: block entry map exists but block size is 1");
     if (m_entryForReducedEntry.size() || m_blockEntryForReducedBlockEntry.size() || m_dataOffsetForScalarHessianLoc.size()) {
         setValuesFromSource(A);
-        m_numericFactorizationImpl(m_A_csc.Ax.data());
+        m_numericFactorizationImpl();
     }
-    else m_numericFactorizationImpl(A.Ax.data());
+    else {
+        if (m_singlePrecision) {
+            m_A_csc_values_float = Eigen::Map<const Eigen::VectorXd>(A.Ax.data(), A.Ax.size()).cast<float>();
+            m_numericFactorizationImpl(m_A_csc_values_float.data());
+        }
+        else m_numericFactorizationImpl(A.Ax.data());
+    }
 }
 
 void AccelerateFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &A,
@@ -254,11 +286,11 @@ void AccelerateFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &A,
     if (B.Ai.size() != A.Ai.size()) throw std::runtime_error("B must have the same sparsity pattern as A");
 
     throw std::runtime_error("AccelerateFactorizer::factorizeNumericWithShift with B not yet implemented (needs to implement data shuffling)");
-    for (long k = 0; k < m_A_csc.nz; ++k) {
-        m_A_csc.Ax[k] = A.Ax[k] + sigma * B.Ax[k];
-    }
+    // for (long k = 0; k < m_A_csc.nz; ++k) {
+    //     m_A_csc.Ax[k] = A.Ax[k] + sigma * B.Ax[k];
+    // }
 
-    m_numericFactorizationImpl(m_A_csc.Ax.data());
+    // m_numericFactorizationImpl(m_A_csc.Ax.data());
 }
 
 void AccelerateFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &A,
@@ -267,7 +299,7 @@ void AccelerateFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &A,
     BENCHMARK_SCOPED_TIMER_SECTION timer("AccelerateFactorizer.factorizeNumeric<" + std::to_string(m_blockSize) + ">");
     // std::cout << "factorizeNumericWithShift sigma I, sigma = " << sigma << std::endl;
     setValuesFromSource(A, sigma);
-    m_numericFactorizationImpl(m_A_csc.Ax.data());
+    m_numericFactorizationImpl();
 }
 
 void AccelerateFactorizer::solveRawReduced(const Real *b,
@@ -275,10 +307,24 @@ void AccelerateFactorizer::solveRawReduced(const Real *b,
                                            CholeskySys sys,
                                            bool) const {
     assertFactorization(sys);
-    DenseVector_Double rhs{ m_reducedSizeScalar, const_cast<Real *>(b) }; // Accelerate doesn't have a const DenseVector...
-    DenseVector_Double sol{ m_reducedSizeScalar, x };
 
-    SparseSolve(m_numfactor->factor, rhs, sol);
+    if (m_singlePrecision) {
+        Eigen::VectorXf b_f = Eigen::Map<const Eigen::VectorXd>(b, m_reducedSizeScalar).cast<float>();
+        Eigen::VectorXf x_f(m_reducedSizeScalar);
+
+        DenseVector_Float rhs{ m_reducedSizeScalar, b_f.data() }; // Accelerate doesn't have a const DenseVector...
+        DenseVector_Float sol{ m_reducedSizeScalar, x_f.data() };
+
+        SparseSolve(m_numfactor_float->factor, rhs, sol);
+
+        Eigen::Map<Eigen::VectorXd>(x, m_reducedSizeScalar) = x_f.cast<double>();
+    }
+    else {
+        DenseVector_Double rhs{ m_reducedSizeScalar, const_cast<Real *>(b) }; // Accelerate doesn't have a const DenseVector...
+        DenseVector_Double sol{ m_reducedSizeScalar, x };
+
+        SparseSolve(m_numfactor->factor, rhs, sol);
+    }
 }
 
 AccelerateFactorizer::~AccelerateFactorizer() = default;
@@ -291,7 +337,9 @@ namespace {
 }
 }
 
-AccelerateFactorizer::AccelerateFactorizer() { throw_accelerate_unavailable(); }
+AccelerateFactorizer::AccelerateFactorizer(bool singlePrecision)
+    : m_singlePrecision(singlePrecision)
+{ throw_accelerate_unavailable(); }
 AccelerateFactorizer::~AccelerateFactorizer() = default;
 
 void AccelerateFactorizer::ensureApple() const { throw_accelerate_unavailable(); }
@@ -299,7 +347,7 @@ void AccelerateFactorizer::m_setUpperTriangleCSC(const SuiteSparseMatrix &) { th
 void AccelerateFactorizer::factorizeSymbolic(const BlockCSCHessianBase &, const std::vector<size_t> &) { throw_accelerate_unavailable(); }
 void AccelerateFactorizer::factorizeSymbolic(const SuiteSparseMatrix &, const std::vector<size_t> &) { throw_accelerate_unavailable(); }
 void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &, const std::vector<size_t> &) { throw_accelerate_unavailable(); }
-void AccelerateFactorizer::m_numericFactorizationImpl(const Real *) { throw_accelerate_unavailable(); }
+void AccelerateFactorizer::m_numericFactorizationImpl(const void *) { throw_accelerate_unavailable(); }
 void AccelerateFactorizer::setValuesFromSource(const SuiteSparseMatrix &, Real) { throw_accelerate_unavailable(); }
 void AccelerateFactorizer::factorizeNumeric(const SuiteSparseMatrix &, bool) { throw_accelerate_unavailable(); }
 void AccelerateFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &, Real, const SuiteSparseMatrix &, bool) { throw_accelerate_unavailable(); }
