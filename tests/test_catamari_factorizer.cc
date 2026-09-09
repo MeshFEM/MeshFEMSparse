@@ -198,4 +198,71 @@ TEST_CASE("Catamari symbolic reuse resets scalar fallback mappings", "[catamari]
     Eigen::VectorXd expected = Eigen::VectorXd::LinSpaced(6, 0.1, 0.9), b = A.apply(expected);
     REQUIRE((f.solve(b) - expected).norm() < (single ? 1e-5 : 1e-12));
 }
+#if MESHFEM_WITH_CHOLMOD
+TEST_CASE("Catamari temporal ND provider defaults to 32 incremental analyses", "[temporal_nd][catamari][factory]") {
+    const bool single = GENERATE(false, true);
+    auto base = make_cholesky_factorizer(CholeskyProvider::CatamariNesdisReuse, single);
+    auto *f = dynamic_cast<CatamariFactorizer *>(base.get());
+    REQUIRE(f != nullptr);
+    REQUIRE(f->orderingMethod == CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
+    REQUIRE(f->temporalReusePeriod() == 32);
+    REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisReuse);
+
+    TripletMatrix<> triplets(16, 16);
+    for (size_t v = 0; v < 16; ++v) {
+        triplets.addNZ(v, v, 4);
+        if (v + 1 < 16) triplets.addNZ(v, v + 1, -1);
+    }
+    SuiteSparseMatrix matrix(triplets);
+    matrix.symmetry_mode = SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE;
+    for (size_t call = 0; call < 34; ++call) {
+        CAPTURE(call, single);
+        base->factorizeSymbolic(matrix, {});
+        const auto &stats = f->temporalReuseStatistics();
+        const bool full = call == 0 || call == 33;
+        REQUIRE(stats.full_rebuild == full);
+        REQUIRE(stats.repartitioned_vertices == (full ? 16 : 0));
+    }
+    base->factorizeNumeric(matrix);
+    Eigen::VectorXd expected = Eigen::VectorXd::LinSpaced(16, -1, 1);
+    Eigen::VectorXd rhs = matrix.apply(expected);
+    REQUIRE((base->solve(rhs) - expected).norm() < 1e-5 * expected.norm());
+
+    f->setTemporalReusePeriod(8);
+    REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisReuse);
+    f->setTemporalReusePeriod(0);
+    REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisParallel);
+    auto plain = make_cholesky_factorizer(CholeskyProvider::CatamariNesdisParallel, single);
+    REQUIRE(plain->provider() == CholeskyProvider::CatamariNesdisParallel);
+    REQUIRE(dynamic_cast<CatamariFactorizer &>(*plain).temporalReusePeriod() == 0);
+}
+
+TEST_CASE("Catamari temporal ND uses the actual block size after scalar fallback", "[temporal_nd][catamari]") {
+    SystemAssembler<3> assembler(32);
+    auto matrix = assembler.blockSparsityPattern(31, [](size_t i) { return std::array<size_t, 2>{{i, i + 1}}; });
+    matrix->setZero();
+    auto scalar = matrix->toScalar();
+    for (auto entry : scalar) matrix->addNZScalar(entry.i, entry.j, entry.i == entry.j ? 10 : -0.1);
+    scalar = matrix->toScalar();
+    CatamariFactorizer f(false, GENERATE(false, true));
+    f.orderingMethod = CatamariFactorizer::OrderingMethod::CholmodNesdisParallel;
+    f.setTemporalReusePeriod(2);
+    // Repeated partial-block pins fall back to scalar ordering. Whole-block
+    // pins switch back to block ordering and must clear the previous history.
+    for (const std::vector<size_t> &pins : {std::vector<size_t>{1}, std::vector<size_t>{0, 1, 2}}) {
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            CAPTURE(pins, repeat);
+            f.factorizeSymbolic(*matrix, pins);
+            REQUIRE(f.temporalReuseStatistics().full_rebuild == (repeat == 0));
+            REQUIRE(f.temporalReuseStatistics().graph_vertices == (pins.size() == 1 ? 95 : 31));
+            if (repeat) REQUIRE(f.temporalReuseStatistics().repartitioned_vertices == 0);
+            f.factorizeNumeric(*matrix);
+            Eigen::VectorXd expected = Eigen::VectorXd::LinSpaced(96, -1, 1);
+            for (size_t v : pins) expected[v] = 0;
+            Eigen::VectorXd rhs = scalar.apply(expected);
+            REQUIRE((f.solve(rhs) - expected).norm() < 1e-5 * expected.norm());
+        }
+    }
+}
+#endif
 #endif

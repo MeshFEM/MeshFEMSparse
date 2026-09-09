@@ -106,9 +106,10 @@ struct SparsityLRU {
     // Returns the number of new entries added to the cache.
     // A return value of 0 means no new entries were added, and the cached
     // sparsity pattern can be reused.
-    // A special value of `EXPIRED` indicates that the cache was
-    // invalidated despite the absence of new entries because some of its
-    // retained entries expired.
+    // A special value of `EXPIRED` indicates a hard-expiration or budget-driven
+    // rebuild. Budget eviction can coincide with additions; in that case this
+    // sentinel replaces the addition count. Callers can use it to request a
+    // fresh ordering as well as symbolic analysis.
     Index update(const SpMat &S_dynamic) {
         BENCHMARK_SCOPED_TIMER_SECTION timer("SparsityLRU.update");
 

@@ -83,6 +83,49 @@ inteface). This inteface is now used by `CatamariFactorizer`, which already
 needed to do this conversion, and did it with our faster parallel
 implementation.
 
+## Exploiting Temporal Coherence of Nested Dissection
+The routine `nested_dissection_temporal` (used by, e.g., `CholeskyProvider::CatamariNesdisReuse` )
+exploits temporal coherence in a sequence of sparsity patterns to avoid
+bisector recomputation. This routine implements the core idea of the PARTH
+algorithm ([Zarebavani et al. 2025: Adaptive Algebraic Reuse of Reordering in
+Cholesky Factorizations with Dynamic Sparsity Patterns]; reference
+implementation released [here](https://github.com/BehroozZare/Parth)), which is
+to only recompute subtrees of the separator tree when they are violated by new
+edges appearing in the matrix graph. In other words, recomputation is only
+needed if an edge connects two vertices that belong to different components (and
+one of those components is not an ancestor of the other); in this case, the
+common ancestor of those two components must be rebuilt.
+
+Our implementation differs from the one described in the paper in a few ways:
+- It processes subtrees in parallel and a final parallel CAMD is run using the approaches described above.
+  The global CAMD is still somewhat wasteful since we expect the orderings
+  of components outside the rebuilt subtree to change very little if at all.
+  A more targeted update would be made possible by retaining the full prior
+  ordering (along with the separator tree) and slicing in updated CAMD orderings
+  for just the rebuilt subtrees. However, the global CAMD time currently does not
+  appear to be a major bottleneck.
+- It does not implement certain features like aggressive reuse (the importance of which
+  is deemphasized somewhat in the PARTH supplement) or support addition or removal of
+  system variables. These features could be added in the future if we notice
+  bottlenecks that they could resolve, but for now we hope that our faster parallel
+  ND implementation will already larly mitigate such slowdowns.
+
+Note that the PARTH approach can degrade ordering since it only rebuilds
+separators when new edges violate them and does not revisit ordering when old
+edges are removed (our current implementation *does* recompute CAMD ordering in
+this case, but it does not update the separator tree).
+Therefore, it can be beneficial to rebuild the full
+ND partitioning occasionally. Ideally this rebuild would be driven by 
+some principled estimate of separator tree quality/staleness, but for now
+we simply rebuild it after a fixed number of analyiss calls
+(after expiration of a "reuse period").
+Selecting `CholeskyProvider::CatamariNesdisReuse` configures a default reuse period of 32
+that can be overriden by a call to
+`CatamariFactorizer::setTemporalReusePeriod(P)` (Python:
+`factorizer.temporalReusePeriod = P`).
+A full ND recomputation is also triggered if our `SparseLRU`
+initiates a re-factorization due to entry cache expiration.
+
 ## Configuration and errors
 
 Environment settings are parsed once per ordering call, before allocating graph

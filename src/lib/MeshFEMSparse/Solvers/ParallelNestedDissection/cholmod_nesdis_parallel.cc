@@ -3,11 +3,14 @@
 #include "nesdis_bisector.hh"
 #include "nesdis_options.hh"
 #include "cholmod_internal_excerpts.hh"
+#include <MeshFEMCore/GlobalBenchmark.hh>
 
 #include <algorithm>
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <sstream>
+#include <iomanip>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -209,7 +212,7 @@ static std::vector<NesdisComponent<Int>> find_components_on_side(
                 Int pdest = pstart;
                 for (Int p = pstart; p < pend; ++p) {
                     const Int i = Bi[p];
-                    if (i == j) continue;
+                    ASSERT(i != j); // Graph construction excludes diagonals.
                     const Int neighbor_state = State[i];
                     if (neighbor_state < EMPTY) continue;
                     Bi[pdest++] = i;
@@ -431,7 +434,7 @@ static void nesdis_process_component
             UInt hash = column;
             for (Int k = 0; k < Bnz[vertex]; ++k) {
                 const Int neighbor = Bi[start + k];
-                // Discovery already removed self-edges and deleted vertices.
+                // Construction excludes self-edges; discovery prunes deleted vertices.
                 ASSERT(neighbor != vertex && Flag[neighbor] >= EMPTY);
                 const Int local = Imap[neighbor];
                 ASSERT(local >= 0 && local < cn && local != column && Cp[column] + k < S->csize);
@@ -598,10 +601,11 @@ static void nesdis_process_component
 //      Allocates a mutable full graph B and node weights Bnw.
 //      Each local workspace owns O(n + nnz(B)) storage; tasks own vertex lists.
 
-// Copy indices without symmetrizing. Leave diagonals for discovery to prune;
-// the dense-node degree test below excludes them before that first traversal.
+// Copy without symmetrizing, filtering optional diagonals. Keep the original
+// column offsets and store live lengths in the caller's Bnz workspace, avoiding
+// a separate compaction pass. As in discovery, B->nz stays null (Bnz is external).
 template<class Int>
-static cholmod_sparse *copy_full_graph(const cholmod_sparse &graph, cholmod_common *Common)
+static cholmod_sparse *copy_full_graph(const cholmod_sparse &graph, Int *Bnz, cholmod_common *Common)
 {
     const auto *Ap = static_cast<const Int *>(graph.p);
     const auto *Ai = static_cast<const Int *>(graph.i);
@@ -614,10 +618,14 @@ static cholmod_sparse *copy_full_graph(const cholmod_sparse &graph, cholmod_comm
         tbb::parallel_for(tbb::blocked_range<size_t>(0, graph.ncol, 256), [&](const auto &range) {
             for (size_t j = range.begin(); j < range.end(); ++j) {
                 Bp[j] = Ap[j];
-                if (Ap[j + 1] > Ap[j]) std::copy(Ai + Ap[j], Ai + Ap[j + 1], Bi + Ap[j]);
+                Int dest = Ap[j];
+                for (Int k = Ap[j]; k < Ap[j + 1]; ++k)
+                    if (Ai[k] != Int(j)) Bi[dest++] = Ai[k];
+                Bnz[j] = dest - Ap[j];
             }
         });
         Bp[graph.ncol] = Ap[graph.ncol];
+        B->packed = FALSE;
     }
     catch (...) {
         CholmodApi<Int>::free_sparse(&B, Common);
@@ -626,6 +634,18 @@ static cholmod_sparse *copy_full_graph(const cholmod_sparse &graph, cholmod_comm
     return B;
 }
 
+// Build a fresh ND forest, or, when ReusedTree is supplied, only flatten its
+// active nodes into postordered CParent/Cmember arrays (no bisectors). ReusedTree
+// must already be valid for the current graph and cover all A->nrow vertices.
+// Unless NDOnly is true, then compute Perm with the configured constrained
+// ordering (hierarchical/global CAMD, CSYMAMD, CCOLAMD, or natural component order).
+// NDOnly callers consume the forest outputs; NDSeconds excludes final ordering.
+// Without FullGraph, symmetric A is expanded and unsymmetric A orders A(:,fset)*A(:,fset)'
+// (all columns if fset is null). FullGraph instead supplies the same symmetric
+// graph directly: square, sorted, packed, duplicate-free CSC with both triangles,
+// stype == 0, optional diagonals, and dimension A->nrow; A->stype must be nonzero.
+// Inputs/Common must use Int indices, Common must be initialized and exclusive
+// to this call, and all three output arrays must have room for A->nrow entries.
 template<class Int>
 static int64_t nested_dissection_impl // returns # of components, or -1 if error
 (
@@ -642,7 +662,11 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
                         // in component c
     cholmod_common *Common,
     const NesdisOptions &options,
-    const cholmod_sparse *FullGraph = nullptr
+    // Borrowed full symmetric, sorted, packed graph; optional diagonals are
+    // filtered from the private ND copy and ignored by the CAMD wrappers.
+    const cholmod_sparse *FullGraph = nullptr,
+    const PersistentSeparatorTree<Int> *ReusedTree = nullptr,
+    bool NDOnly = false, double *NDSeconds = nullptr
 )
 {
     const auto nesdis_start = std::chrono::steady_clock::now();
@@ -740,11 +764,17 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
     // convert B to symmetric form with both upper/lower parts present
     //--------------------------------------------------------------------------
 
+    double partition_seconds = 0;
+    if (ReusedTree) {
+        // Note: ND is skipped when ReusedTree is passed!
+        ncomponents = ReusedTree->flatten(CParent, Cmember);
+    }
+    else {
     // B = A+A', A*A', or A(:,f)*A(:,f)', upper and lower parts present
 
     if (FullGraph)
     {
-        B = copy_full_graph<Int>(*FullGraph, Common);
+        B = copy_full_graph<Int>(*FullGraph, Bnz, Common);
     }
     else if (A->stype)
     {
@@ -766,9 +796,7 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
     }
     Bp = (Int *) B->p ;
     Bi = (Int *) B->i ;
-    bnz = CholmodApi<Int>::nnz (B, Common) ;
     ASSERT ((Int) (B->nrow) == n && (Int) (B->ncol) == n) ;
-    csize = MAX (n, bnz) ;
 
     //--------------------------------------------------------------------------
     // initializations
@@ -800,12 +828,13 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
     cnode = EMPTY ;
     cdense = EMPTY ;
 
+    bnz = 0;
     for (j = 0 ; j < n ; j++)
     {
-        Bnz [j] = Bp [j+1] - Bp [j] ;
-        Int degree = Bnz[j];
-        if (FullGraph && std::binary_search(Bi + Bp[j], Bi + Bp[j + 1], j)) --degree;
-        if (degree > threshold)
+        // FullGraph's copy has gaps and already supplied the live lengths.
+        if (!FullGraph) Bnz [j] = Bp [j+1] - Bp [j] ;
+        bnz += Bnz[j];
+        if (Bnz[j] > threshold)
         {
             // node j is dense, prune it from B
             PRINT2 (("j is dense %d\n", j)) ;
@@ -821,6 +850,7 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
             Flag [j] = FLIP (cnode) ;
         }
     }
+    csize = MAX (n, bnz) ;
     B->packed = FALSE ;
     ASSERT (B->nz == NULL) ;
 
@@ -838,6 +868,8 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
         CholmodApi<Int>::free_sparse (&B, Common) ;
         Common->mark = EMPTY ;
         clear_common_flag<Int> (Common) ;
+        if (NDSeconds) *NDSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - nesdis_start).count();
         return (1) ;
     }
 
@@ -905,7 +937,7 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
         throw ;
     }
 
-    const double partition_seconds = std::chrono::duration<double>(
+    partition_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - partition_start).count();
 
     //--------------------------------------------------------------------------
@@ -1114,6 +1146,12 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
     Common->mark = EMPTY ;
     clear_common_flag<Int> (Common) ;
 
+    } // full ND; reused trees already provide postordered membership
+
+    if (NDSeconds) *NDSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - nesdis_start).count();
+    if (NDOnly) return ncomponents;
+
     //--------------------------------------------------------------------------
     // find the permutation
     //--------------------------------------------------------------------------
@@ -1126,6 +1164,7 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
 
     if (nd_camd)
     {
+        BENCHMARK_SCOPED_TIMER_SECTION t_camd("CAMD");
 
         //----------------------------------------------------------------------
         // apply camd, csymamd, or ccolamd using the Cmember constraints
@@ -1268,11 +1307,211 @@ static int64_t nested_dissection_impl // returns # of components, or -1 if error
 
 
 
+// A fresh CHOLMOD context is required for each concurrently repaired graph;
+// copying Common would alias its Flag/Head/Iwork storage.
+template<class Int>
+struct SubtreeCommon {
+    cholmod_common value;
+    explicit SubtreeCommon(const cholmod_common &source) {
+        if constexpr (sizeof(Int) == 4) cholmod_start(&value);
+        else cholmod_l_start(&value);
+        value.current = 0;
+        value.method[0] = source.method[source.current];
+        value.error_handler = source.error_handler;
+        value.print = source.print;
+        value.metis_memory = source.metis_memory;
+        value.metis_dswitch = source.metis_dswitch;
+        value.metis_nswitch = source.metis_nswitch;
+    }
+    ~SubtreeCommon() {
+        if constexpr (sizeof(Int) == 4) cholmod_finish(&value);
+        else cholmod_l_finish(&value);
+    }
+};
+
+template<class Int>
+static PersistentSeparatorTree<Int> compute_nd_subtree(const cholmod_sparse &graph,
+    const std::vector<Int> &vertices, const std::vector<Int> &local_index,
+    const cholmod_common &common, const NesdisOptions &options)
+{
+    const auto *p = static_cast<const Int *>(graph.p);
+    const auto *i = static_cast<const Int *>(graph.i);
+    const size_t n = vertices.size();
+    std::vector<Int> sub_p(n + 1), sub_i;
+    for (size_t v = 0; v < n; ++v) {
+        for (Int k = p[vertices[v]]; k < p[vertices[v] + 1]; ++k) {
+            Int local = local_index[i[k]];
+            // local_index covers all dirty regions. Test the inverse map too,
+            // excluding ancestor separators, other regions, and diagonals.
+            if (local >= 0 && size_t(local) < n && local != Int(v) && vertices[local] == i[k])
+                sub_i.push_back(local);
+        }
+        sub_p[v + 1] = Int(sub_i.size());
+        // The explicit graph API is sorted, but cholmod_aat can produce
+        // unsorted columns when the stateful matrix API orders A*A'.
+        if (!graph.sorted) std::sort(sub_i.begin() + sub_p[v], sub_i.end());
+    }
+    cholmod_sparse induced{};
+    induced.nrow = induced.ncol = n;
+    induced.nzmax = sub_i.size();
+    if (sub_i.empty()) sub_i.push_back(0);
+    induced.p = sub_p.data(); induced.i = sub_i.data();
+    induced.packed = induced.sorted = 1;
+    induced.itype = graph.itype;
+    induced.xtype = CHOLMOD_PATTERN;
+    SubtreeCommon<Int> local(common);
+    std::vector<Int> perm(n), parent(n), member(n);
+    auto A = induced;
+    A.stype = 1;
+    auto nc = nested_dissection_impl<Int>(&A, nullptr, 0, perm.data(), parent.data(),
+        member.data(), &local.value, options, &induced, nullptr, true);
+    if (nc < 0) throw nesdis_failure(local.value.status);
+    return PersistentSeparatorTree<Int>::from_cholmod(n, Int(nc), parent.data(), member.data());
+}
+
+static std::string partition_settings(const cholmod_common &common, const NesdisOptions &options) {
+    const auto &m = common.method[common.current];
+    std::ostringstream key;
+    key << std::setprecision(17) << m.prune_dense << ' ' << m.nd_compress << ' '
+        << m.nd_oksep << ' ' << m.nd_small << ' ' << m.nd_components << ' '
+        << options.scotch_levels << ' ' << options.scotch_threads << ' '
+        << options.scotch_seed << ' ' << options.scotch_strategy;
+    return key.str();
+}
+
+// Stateful driver with the same matrix/FullGraph and workspace contracts as
+// nested_dissection_impl. The caller owns reuse exclusively, enables a positive
+// reuse period, and preserves vertex identities across analyses (reset after
+// relabeling). Missing/incompatible history, period expiry, or a global separator
+// violation triggers full ND; otherwise repair only dirty subtrees with NDOnly.
+// In either case, run final constrained ordering on the current graph; repaired
+// or unchanged forests are flattened through ReusedTree without repeating ND.
+// Commit history only after success; an empty input clears the history.
+template<class Int>
+static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t fsize,
+    Int *Perm, Int *CParent, Int *Cmember, cholmod_common *Common,
+    const NesdisOptions &options, const cholmod_sparse *FullGraph, TemporalReuseState<Int> &reuse)
+{
+    BENCHMARK_SCOPED_TIMER_SECTION tfull("nested_dissection_temporal");
+    if (!A || !Perm || !CParent || !Cmember) {
+        Common->status = CHOLMOD_INVALID;
+        return EMPTY;
+    }
+    if (A->nrow == 0) {
+        reuse.reset();
+        Common->status = CHOLMOD_OK;
+        return 1;
+    }
+    Common->status = CHOLMOD_OK;
+    const auto start = std::chrono::steady_clock::now();
+    auto settings = partition_settings(*Common, options);
+    const bool have_tree = !reuse.tree.roots.empty() && reuse.tree.member.size() == A->nrow;
+    bool full = !have_tree || settings != reuse.partition_settings ||
+        reuse.incremental_analyses_since_rebuild >= reuse.temporal_reuse_period;
+    // Own the converted graph only when the caller did not supply a full graph.
+    auto deleter = [Common](cholmod_sparse *g) { CholmodApi<Int>::free_sparse(&g, Common); };
+    std::unique_ptr<cholmod_sparse, decltype(deleter)> owned(nullptr, deleter);
+    const cholmod_sparse *graph = FullGraph;
+    typename PersistentSeparatorTree<Int>::DirtySubtrees dirty;
+    if (!full) {
+        if (!graph) {
+            owned.reset(A->stype ? CholmodApi<Int>::copy(A, 0, -1, Common)
+                                : CholmodApi<Int>::aat(A, fset, fsize, -1, Common));
+            if (!owned || Common->status < CHOLMOD_OK) return EMPTY;
+            graph = owned.get();
+        }
+        dirty = reuse.tree.dirty_subtrees(static_cast<const Int *>(graph->p),
+                                          static_cast<const Int *>(graph->i));
+        full = dirty.full_rebuild;
+    }
+    TemporalReuseStatistics statistics;
+    statistics.full_rebuild = full;
+    statistics.graph_vertices = A->nrow;
+    PersistentSeparatorTree<Int> candidate;
+    int64_t nc;
+    double ordering_nd_seconds = 0;
+    if (full) {
+        BENCHMARK_SCOPED_TIMER_SECTION tfull_recompute("full ND recompute");
+        const double preparation_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        {
+            BENCHMARK_SCOPED_TIMER_SECTION timer("nested_dissection_impl");
+            nc = nested_dissection_impl<Int>(A, fset, fsize, Perm, CParent, Cmember,
+                Common, options, FullGraph, nullptr, false, &ordering_nd_seconds);
+        }
+        if (nc < 0) return nc;
+        const auto capture_start = std::chrono::steady_clock::now();
+        candidate = PersistentSeparatorTree<Int>::from_cholmod(A->nrow, Int(nc), CParent, Cmember);
+        statistics.repartitioned_vertices = A->nrow;
+        statistics.nd_seconds = preparation_seconds + ordering_nd_seconds +
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - capture_start).count();
+    }
+    else {
+        std::vector<std::vector<Int>> regions;
+        if (!dirty.roots.empty()) {
+            std::vector<Int> local_index;
+            {
+                BENCHMARK_SCOPED_TIMER_SECTION timer("temporal ND region construction");
+                typename PersistentSeparatorTree<Int>::SubtreeRegionLabels region_labels;
+                {
+                    // BENCHMARK_SCOPED_TIMER_SECTION label_timer("label and reserve regions");
+                    region_labels = reuse.tree.label_subtree_regions(dirty.roots, regions);
+                }
+                {
+                    // BENCHMARK_SCOPED_TIMER_SECTION gather_timer("gather vertices and inverse map");
+                    reuse.tree.gather_subtree_regions(region_labels, regions, local_index);
+                }
+                for (const auto &region : regions) statistics.repartitioned_vertices += region.size();
+            }
+            std::vector<PersistentSeparatorTree<Int>> replacements;
+            {
+                // Keep the global section timer on the calling thread; worker
+                // tasks must not mutate the shared benchmark section stack.
+                BENCHMARK_SCOPED_TIMER_SECTION timer("temporal ND region recomputation");
+                replacements.resize(regions.size());
+                tbb::parallel_for(size_t(0), regions.size(), [&](size_t r) {
+                    auto subtree_options = options;
+                    // Scotch's level limit refers to depth in the persistent tree,
+                    // while recursion on the induced graph starts at depth zero.
+                    subtree_options.scotch_levels = int(std::max<int64_t>(0,
+                        int64_t(options.scotch_levels) - reuse.tree.depth[dirty.roots[r]]));
+                    replacements[r] = compute_nd_subtree<Int>(*graph, regions[r], local_index, *Common, subtree_options);
+                });
+            }
+            {
+                BENCHMARK_SCOPED_TIMER_SECTION timer("temporal ND region splicing");
+                candidate = reuse.tree;
+                for (size_t r = 0; r < regions.size(); ++r)
+                    candidate.replace(dirty.roots[r], replacements[r], regions[r]);
+                candidate.update_depths();
+            }
+        }
+        statistics.recomputed_subtrees = regions.size();
+        const auto *tree = regions.empty() ? &reuse.tree : &candidate;
+        const double repair_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        {
+            BENCHMARK_SCOPED_TIMER_SECTION timer("nested_dissection_impl");
+            nc = nested_dissection_impl<Int>(A, fset, fsize, Perm, CParent, Cmember,
+                Common, options, FullGraph, tree, false, &ordering_nd_seconds);
+        }
+        if (nc < 0) return nc;
+        statistics.nd_seconds = repair_seconds + ordering_nd_seconds;
+    }
+    // Commit only after the final CAMD/permutation stage has succeeded.
+    if (full || !dirty.roots.empty()) reuse.tree = std::move(candidate);
+    reuse.incremental_analyses_since_rebuild = full ? 0 : reuse.incremental_analyses_since_rebuild + 1;
+    reuse.partition_settings = std::move(settings);
+    reuse.statistics = statistics;
+    return nc;
+}
+
 template<class Int>
 static int64_t nested_dissection_checked(cholmod_sparse *A, Int *fset, size_t fsize,
                                          Int *Perm, Int *CParent, Int *Cmember,
                                          cholmod_common *Common,
-                                         const cholmod_sparse *FullGraph = nullptr) noexcept {
+                                         const cholmod_sparse *FullGraph = nullptr,
+                                         TemporalReuseState<Int> *reuse = nullptr) noexcept {
     if (!Common) return EMPTY;
     // The C and full-graph APIs share one exception boundary, including optional
     // diagnostics. Internal catches only clean up owned storage before rethrowing.
@@ -1281,7 +1520,15 @@ static int64_t nested_dissection_checked(cholmod_sparse *A, Int *fset, size_t fs
         std::unique_ptr<tbb::global_control> thread_limit;
         if (options.threads) thread_limit = std::make_unique<tbb::global_control>(
             tbb::global_control::max_allowed_parallelism, options.threads);
-        return nested_dissection_impl<Int>(A, fset, fsize, Perm, CParent, Cmember, Common, options, FullGraph);
+        if (reuse && reuse->temporal_reuse_period)
+            return nested_dissection_temporal<Int>(A, fset, fsize, Perm, CParent, Cmember,
+                                                   Common, options, FullGraph, *reuse);
+        // Only time caller-thread invocations: ND-only subtree calls run in
+        // parallel, while benchmark sections share a global section stack.
+        BENCHMARK_SCOPED_TIMER_SECTION timer("nested_dissection_impl");
+        auto result = nested_dissection_impl<Int>(A, fset, fsize, Perm, CParent, Cmember, Common, options, FullGraph);
+        if (reuse && result >= 0) reuse->reset();
+        return result;
     }
     catch (const nesdis_failure &failure) {
         Common->status = failure.status < CHOLMOD_OK ? failure.status : CHOLMOD_INVALID;
@@ -1297,7 +1544,7 @@ static int64_t nested_dissection_checked(cholmod_sparse *A, Int *fset, size_t fs
 
 template<class Int>
 int64_t nested_dissection_from_graph(const cholmod_sparse &graph,
-    Int *Perm, Int *CParent, Int *Cmember, cholmod_common *Common)
+    Int *Perm, Int *CParent, Int *Cmember, cholmod_common *Common, TemporalReuseState<Int> *reuse)
 {
     if (!Common) return EMPTY;
     const int itype = sizeof(Int) == sizeof(int32_t) ? CHOLMOD_INT : CHOLMOD_LONG;
@@ -1311,13 +1558,23 @@ int64_t nested_dissection_from_graph(const cholmod_sparse &graph,
     // Only this explicit graph API bypasses A*A' semantics for stype == 0.
     auto A = graph;
     A.stype = 1;
-    return nested_dissection_checked<Int>(&A, nullptr, 0, Perm, CParent, Cmember, Common, &graph);
+    return nested_dissection_checked<Int>(&A, nullptr, 0, Perm, CParent, Cmember, Common, &graph, reuse);
 }
 
 template int64_t nested_dissection_from_graph<int32_t>(const cholmod_sparse &,
-    int32_t *, int32_t *, int32_t *, cholmod_common *);
+    int32_t *, int32_t *, int32_t *, cholmod_common *, TemporalReuseState<int32_t> *);
 template int64_t nested_dissection_from_graph<int64_t>(const cholmod_sparse &,
-    int64_t *, int64_t *, int64_t *, cholmod_common *);
+    int64_t *, int64_t *, int64_t *, cholmod_common *, TemporalReuseState<int64_t> *);
+
+template<class Int>
+int64_t nested_dissection(cholmod_sparse *A, Int *fset, size_t fsize,
+    Int *Perm, Int *CParent, Int *Cmember, cholmod_common *Common, TemporalReuseState<Int> &reuse) {
+    return nested_dissection_checked<Int>(A, fset, fsize, Perm, CParent, Cmember, Common, nullptr, &reuse);
+}
+template int64_t nested_dissection<int32_t>(cholmod_sparse *, int32_t *, size_t,
+    int32_t *, int32_t *, int32_t *, cholmod_common *, TemporalReuseState<int32_t> &);
+template int64_t nested_dissection<int64_t>(cholmod_sparse *, int64_t *, size_t,
+    int64_t *, int64_t *, int64_t *, cholmod_common *, TemporalReuseState<int64_t> &);
 
 } // namespace MeshFEM::CholmodParallelNesdis
 

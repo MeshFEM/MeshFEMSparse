@@ -36,6 +36,7 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
         case CholeskyProvider::Catamari:
         case CholeskyProvider::CatamariNesdis:
         case CholeskyProvider::CatamariNesdisParallel:
+        case CholeskyProvider::CatamariNesdisReuse:
         case CholeskyProvider::CatamariMetis:
         case CholeskyProvider::CatamariLegacy:
         case CholeskyProvider::CatamariAMD:
@@ -50,8 +51,10 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::Catamari;
                 else if ((provider == CholeskyProvider::CatamariNesdis) || (provider == CholeskyProvider::CatamariLegacy))
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::CholmodNesdis;
-                else if (provider == CholeskyProvider::CatamariNesdisParallel)
+                else if (provider == CholeskyProvider::CatamariNesdisParallel || provider == CholeskyProvider::CatamariNesdisReuse) {
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::CholmodNesdisParallel;
+                    if (provider == CholeskyProvider::CatamariNesdisReuse) c->setTemporalReusePeriod(32);
+                }
                 else if (provider == CholeskyProvider::CatamariMetis)
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::Metis;
                 else if (provider == CholeskyProvider::CatamariAMD)

@@ -92,7 +92,7 @@ struct CatamariConverterT {
                         new_entries[ii].column = i;
                         // Legacy Factor also performs a numeric pass; give it a
                         // valid identity matrix while constructing the symbolic factor.
-                        if (legacy) new_entries[ii].value = (i == j) ? Field(1) : Field(0);
+                        if (legacy) new_entries[ii].value = (i == static_cast<SuiteSparse_long>(j)) ? Field(1) : Field(0);
                     }
                 }, /* grain_size = */ 64, /* parallelism_threshold = */ 128);
             }

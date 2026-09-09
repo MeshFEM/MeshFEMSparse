@@ -212,6 +212,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
             // TODO: keep the partially pinned block in the sparsity pattern and
             // apply the scalar pin constraint during numeric factorization?
         }
+        m_prepareTemporalReuse(pinnedVars);
         A_reduced = m_initRowColRemoval(mat, pinnedBlockVars);
         blockEntryForReducedBlockEntry.swap(m_entryForReducedEntry);
         reducedRowForRow_block.swap(m_reducedRowForRow);
@@ -239,6 +240,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
         }
     }
     else {
+        m_prepareTemporalReuse(pinnedVars);
         A_reduced = m_initRowColRemoval(mat, pinnedVars);
         reducedRowForRow_block = m_reducedRowForRow;
     }

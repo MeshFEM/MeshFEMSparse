@@ -16,7 +16,8 @@
 namespace MeshFEM {
 
 enum class CholeskyProvider {
-    CHOLMOD, Catamari, CatamariNesdis, CatamariNesdisParallel, CatamariMetis, CatamariLegacy, CatamariAMD, CatamariScotch, CatamariAdaptive, PARDISO, Accelerate
+    CHOLMOD, Catamari, CatamariNesdis, CatamariNesdisParallel, CatamariMetis, CatamariLegacy, CatamariAMD, CatamariScotch, CatamariAdaptive, PARDISO, Accelerate,
+    CatamariNesdisReuse
 };
 
 // Eigen provides a `swap` method rather than overloading `std::swap`
@@ -226,6 +227,10 @@ struct CholeskyFactorizerBase {
     // (e.g., because it thinks a higher-quality variable ordering
     // will pay off).
     virtual bool wantsSymbolicFactorizationRecompute() const { return false; }
+
+    // Discard history that would be reused by the next symbolic analysis, e.g.
+    // an ND separator tree. Existing factors remain usable until reanalysis.
+    virtual void resetSymbolicFactorizationReuse() { }
 
     void assertFactorization(FactorizationType type)           const { if (!hasFactorization(type)) throw std::runtime_error(((type == FactorizationType::Numeric) ? "Numeric" : "Symbolic") + std::string(" factorization does not exist")); }
     void assertFactorization(CholeskySys sys = CholeskySys::A) const { if (!hasFactorization( sys)) throw std::runtime_error("Factorization does not exist"); }

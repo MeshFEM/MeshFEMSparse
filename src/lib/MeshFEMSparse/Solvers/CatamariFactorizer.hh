@@ -79,6 +79,18 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
 
     void clearFactors() override;
 
+    // Reuse only parallel-ND separators across symbolic analyses. Pin and block
+    // changes reset automatically; explicitly reset after other relabelings.
+    void setTemporalReusePeriod(size_t period) { m_cholmodOrdering.setTemporalReusePeriod(period); }
+    size_t temporalReusePeriod() const { return m_cholmodOrdering.temporalReusePeriod(); }
+    void resetTemporalReuse() { m_cholmodOrdering.resetTemporalReuse(); }
+    void resetSymbolicFactorizationReuse() override { resetTemporalReuse(); }
+#if MESHFEM_WITH_CHOLMOD
+    const CholmodParallelNesdis::TemporalReuseStatistics &temporalReuseStatistics() const {
+        return m_cholmodOrdering.temporalReuseStatistics();
+    }
+#endif
+
     void solveMultiRHS(const Eigen::Matrix<Real, Eigen::Dynamic, Eigen::Dynamic> &B, Eigen::Matrix<Real, Eigen::Dynamic, Eigen::Dynamic> &X) const override;
 
     // Raw pointer version (Use with care! Caller must allocate/own both pointers)
@@ -114,7 +126,8 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
 
         if (orderingMethod == OrderingMethod::Catamari)           return CholeskyProvider::Catamari;
         else if (orderingMethod == OrderingMethod::CholmodNesdis) return CholeskyProvider::CatamariNesdis;
-        else if (orderingMethod == OrderingMethod::CholmodNesdisParallel) return CholeskyProvider::CatamariNesdisParallel;
+        else if (orderingMethod == OrderingMethod::CholmodNesdisParallel)
+            return temporalReusePeriod() ? CholeskyProvider::CatamariNesdisReuse : CholeskyProvider::CatamariNesdisParallel;
         else if (orderingMethod == OrderingMethod::AMD)           return CholeskyProvider::CatamariAMD;
         else if (orderingMethod == OrderingMethod::Adaptive)      return CholeskyProvider::CatamariAdaptive;
         else if (orderingMethod == OrderingMethod::Scotch)        return CholeskyProvider::CatamariScotch;
@@ -207,6 +220,16 @@ private:
 
     CholmodOrdering m_cholmodOrdering;
     size_t m_blockSize = 1;
+    size_t m_temporalBlockSize = 0;
+    void m_prepareTemporalReuse(const std::vector<size_t> &pinnedVars) {
+        if (!temporalReusePeriod()) return;
+        auto sortedPins = pinnedVars;
+        std::sort(sortedPins.begin(), sortedPins.end());
+        sortedPins.erase(std::unique(sortedPins.begin(), sortedPins.end()), sortedPins.end());
+        if (m_temporalBlockSize != m_blockSize || sortedPins != m_fixedVars)
+            resetTemporalReuse();
+        m_temporalBlockSize = m_blockSize;
+    }
     size_t m_useBlockAccel = true;
 
     // Support fused pre-permutation functionality (where row-col-removal is fused with permutation)

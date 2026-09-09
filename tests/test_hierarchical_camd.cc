@@ -638,3 +638,640 @@ TEMPLATE_TEST_CASE("CHOLMOD preliminary forest follows the final permutation", "
         REQUIRE(forest.parents.empty());
     }
 }
+
+namespace {
+template<class Int>
+void check_separator_forest(const Graph<Int> &graph, Int nc, const std::vector<Int> &parent,
+                            const std::vector<Int> &member, const std::vector<Int> &perm) {
+    REQUIRE(nc > 0);
+    REQUIRE(size_t(nc) <= graph.view.nrow);
+    auto sorted = perm;
+    std::sort(sorted.begin(), sorted.end());
+    std::vector<Int> counts(nc, 0);
+    for (size_t v = 0; v < sorted.size(); ++v) {
+        REQUIRE(sorted[v] == Int(v));
+        REQUIRE(member[v] >= 0);
+        REQUIRE(member[v] < nc);
+        ++counts[member[v]];
+    }
+    for (Int c = 0; c < nc; ++c) {
+        REQUIRE(counts[c] > 0);
+        REQUIRE((parent[c] == -1 || (parent[c] > c && parent[c] < nc)));
+    }
+    auto ancestor = [&](Int a, Int b) {
+        for (; b >= 0; b = parent[b]) if (a == b) return true;
+        return false;
+    };
+    for (size_t v = 0; v < graph.view.nrow; ++v)
+        for (Int k = graph.p[v]; k < graph.p[v + 1]; ++k)
+            REQUIRE((ancestor(member[v], member[graph.i[k]]) || ancestor(member[graph.i[k]], member[v])));
+}
+
+template<class Int>
+PersistentSeparatorTree<Int> test_temporal_tree() {
+    const Int parent[]{2, 2, 6, 5, 5, 6, 14, 9, 9, 13, 12, 12, 13, 14, -1};
+    std::vector<Int> member(30);
+    for (Int v = 0; v < 30; ++v) member[v] = v / 2;
+    return PersistentSeparatorTree<Int>::from_cholmod(30, 15, parent, member.data());
+}
+
+template<class Int>
+std::vector<std::pair<Int, Int>> test_temporal_edges() {
+    auto tree = test_temporal_tree<Int>();
+    std::vector<std::pair<Int, Int>> edges;
+    for (Int c = 0; c < 15; ++c) {
+        // Leave each node's two vertices unconnected so a later within-node
+        // edge is an actual insertion. Diagonals exercise full-graph handling.
+        edges.emplace_back(2 * c, 2 * c);
+        Int p = tree.nodes[c].parent;
+        if (p >= 0) {
+            edges.emplace_back(2 * c, 2 * p);
+            edges.emplace_back(2 * c + 1, 2 * p);
+        }
+    }
+    return edges;
+}
+}
+
+TEMPLATE_TEST_CASE("temporal ND detects minimal disjoint invalid subtrees", "[temporal_nd]", int32_t, int64_t) {
+    using Int = TestType;
+    auto tree = test_temporal_tree<Int>();
+    auto edges = test_temporal_edges<Int>();
+    std::vector<Int> expected;
+    bool full = false;
+    SECTION("unchanged") {}
+    SECTION("deletion") { edges.clear(); }
+    SECTION("within node") { edges.emplace_back(0, 1); }
+    SECTION("separator to descendant") { edges.emplace_back(13, 0); }
+    SECTION("siblings") { edges.emplace_back(0, 2); expected = {2}; }
+    SECTION("duplicate violations") { edges.emplace_back(0, 2); edges.emplace_back(1, 3); expected = {2}; }
+    SECTION("disjoint") { edges.emplace_back(0, 2); edges.emplace_back(14, 16); expected = {2, 9}; }
+    SECTION("nested") { edges.emplace_back(0, 2); edges.emplace_back(0, 6); expected = {6}; }
+    SECTION("root") { edges.emplace_back(0, 14); full = true; }
+    Graph<Int> graph(30, edges);
+    const auto dirty = tree.dirty_subtrees(graph.p.data(), graph.i.data());
+    REQUIRE(dirty.full_rebuild == full);
+    REQUIRE(dirty.roots == expected);
+    std::vector<Int> parent(30), member(30), perm(30);
+    auto nc = tree.flatten(parent.data(), member.data());
+    auto roundtrip = PersistentSeparatorTree<Int>::from_cholmod(30, nc, parent.data(), member.data());
+    REQUIRE(roundtrip.member == tree.member);
+    REQUIRE(roundtrip.roots == tree.roots);
+    for (size_t c = 0; c < tree.nodes.size(); ++c) {
+        REQUIRE(roundtrip.nodes[c].parent == tree.nodes[c].parent);
+        REQUIRE(roundtrip.nodes[c].children == tree.nodes[c].children);
+    }
+}
+
+TEMPLATE_TEST_CASE("temporal ND parallel dirty scan preserves repair decisions", "[temporal_nd]", int32_t, int64_t) {
+    using Int = TestType;
+    const Int trees = GENERATE(1, 2), copies = 256, stride = 30 * trees, n = stride * copies;
+    const bool unsorted = GENERATE(false, true);
+    const auto base = test_temporal_tree<Int>();
+    std::vector<Int> parent(15 * trees), member(n);
+    for (Int c = 0; c < 15 * trees; ++c) {
+        Int p = base.nodes[c % 15].parent;
+        parent[c] = p < 0 ? -1 : p + 15 * (c / 15);
+    }
+    std::vector<std::pair<Int, Int>> edges;
+    for (Int block = 0; block < copies; ++block) for (Int t = 0; t < trees; ++t) {
+        const Int offset = block * stride + 30 * t;
+        for (Int v = 0; v < 30; ++v) member[offset + v] = 15 * t + v / 2;
+        for (auto [a, b] : test_temporal_edges<Int>()) edges.emplace_back(offset + a, offset + b);
+    }
+    const auto tree = PersistentSeparatorTree<Int>::from_cholmod(n, Int(parent.size()), parent.data(), member.data());
+    std::vector<Int> expected;
+    bool full = false;
+    SECTION("valid edges") {}
+    SECTION("concurrent marks of the same disjoint nodes") {
+        for (Int block = 0; block < copies; ++block) {
+            edges.emplace_back(block * stride, block * stride + 2);
+            edges.emplace_back(block * stride + 14, block * stride + 16);
+        }
+        expected = {2, 9};
+    }
+    SECTION("dirty ancestors subsume concurrent descendant marks") {
+        for (Int block = 0; block < copies; ++block) {
+            edges.emplace_back(block * stride, block * stride + 2);
+            edges.emplace_back(block * stride, block * stride + 6);
+        }
+        expected = {6};
+    }
+    SECTION("root violations respect the forest") {
+        for (Int block = 0; block < copies; ++block)
+            edges.emplace_back(block * stride, block * stride + 14);
+        if (trees == 1) full = true;
+        else expected = {14};
+    }
+    SECTION("late full rebuild overrides earlier dirty marks") {
+        for (Int block = 0; block < copies; ++block)
+            edges.emplace_back(block * stride, block * stride + 2);
+        edges.emplace_back(0, trees == 1 ? n - stride + 14 : n - 30);
+        full = true;
+    }
+    Graph<Int> graph(n, edges);
+    // Matrix A*A' conversion can produce unsorted columns.
+    if (unsorted)
+        for (Int v = 0; v < n; ++v) std::reverse(graph.i.begin() + graph.p[v], graph.i.begin() + graph.p[v + 1]);
+    for (size_t threads : {1, 2, 4}) {
+        tbb::global_control control(tbb::global_control::max_allowed_parallelism, threads);
+        for (int repeat = 0; repeat < 8; ++repeat) {
+            const auto dirty = tree.dirty_subtrees(graph.p.data(), graph.i.data());
+            REQUIRE(dirty.full_rebuild == full);
+            REQUIRE(dirty.roots == expected);
+        }
+    }
+}
+
+TEMPLATE_TEST_CASE("temporal ND collects vertices in tree order without duplicates", "[temporal_nd]", int32_t, int64_t) {
+    using Int = TestType;
+    const auto tree = test_temporal_tree<Int>();
+    // In this subtree the separator's global IDs follow the leaf IDs. Raw
+    // collection keeps this order; the batched repair gather orders by global ID.
+    const auto vertices = tree.subtree_vertices(2);
+    REQUIRE(vertices == std::vector<Int>{4, 5, 0, 1, 2, 3});
+    auto all = tree.subtree_vertices(14);
+    REQUIRE_FALSE(std::is_sorted(all.begin(), all.end()));
+    std::sort(all.begin(), all.end());
+    REQUIRE(all.size() == 30);
+    for (Int v = 0; v < 30; ++v) REQUIRE(all[v] == v);
+}
+
+TEMPLATE_TEST_CASE("temporal ND batch gather matches sorted subtree regions", "[temporal_nd]", int32_t, int64_t) {
+    using Int = TestType;
+    auto tree = test_temporal_tree<Int>();
+    std::vector<Int> dirty{2, 9};
+    // A large unrelated root makes the selected regions small enough to use
+    // merging. Without it, the same requests exercise the ordered scan.
+    if (GENERATE(false, true)) {
+        tree.nodes.emplace_back();
+        tree.roots.push_back(15);
+        for (Int v = 30; v < 1024; ++v) tree.nodes[15].separator_vertices.push_back(v);
+        tree.member.resize(1024, 15);
+        tree.update_depths();
+    }
+    SECTION("disjoint subtrees") {}
+    SECTION("whole tree") { dirty = {14}; }
+    SECTION("after replacement with nonmonotone vertex numbering") {
+        const Int parent[]{-1, -1}, member[]{0, 0, 0, 1, 1, 1};
+        auto replacement = PersistentSeparatorTree<Int>::from_cholmod(6, 2, parent, member);
+        auto vertices = tree.subtree_vertices(2);
+        tree.replace(2, replacement, vertices);
+        tree.update_depths();
+        dirty = {6, 9};
+    }
+    std::vector<std::vector<Int>> regions;
+    auto labels = tree.label_subtree_regions(dirty, regions);
+    std::vector<Int> local_index;
+    tree.gather_subtree_regions(labels, regions, local_index);
+    std::vector<Int> reference_index(tree.member.size(), -1);
+    REQUIRE(regions.size() == dirty.size());
+    for (size_t r = 0; r < dirty.size(); ++r) {
+        auto reference = tree.subtree_vertices(dirty[r]);
+        std::sort(reference.begin(), reference.end());
+        REQUIRE(regions[r] == reference);
+        for (size_t v = 0; v < reference.size(); ++v) reference_index[reference[v]] = Int(v);
+    }
+    REQUIRE(local_index == reference_index);
+}
+
+TEMPLATE_TEST_CASE("temporal ND repairs induced subgraphs and reruns CAMD", "[temporal_nd]", int32_t, int64_t) {
+    using Int = TestType;
+    Environment threads("CHOLMOD_NESDIS_NUM_THREADS", GENERATE("1", "4"));
+    Environment serial_size("CHOLMOD_NESDIS_SERIAL_SUBTREE_SIZE", "4");
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    Environment camd("CHOLMOD_NESDIS_CAMD_CUT_DEPTH", GENERATE("-1", "0", "4"));
+    Environment verify("CHOLMOD_NESDIS_CAMD_VERIFY", "1");
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    common.value.method[0].nd_small = 4;
+    common.value.method[0].nd_compress = GENERATE(0, 1);
+    common.value.method[0].prune_dense = -1;
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 8;
+    auto edges = test_temporal_edges<Int>();
+    Graph<Int> initial(30, edges);
+    std::vector<Int> parent(30), member(30), perm(30);
+    auto order = [&](const Graph<Int> &graph) {
+        auto nc = nested_dissection_from_graph<Int>(graph.view, perm.data(), parent.data(), member.data(), &common.value, &reuse);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        check_separator_forest(graph, Int(nc), parent, member, perm);
+        return nc;
+    };
+    order(initial);
+    REQUIRE(reuse.statistics.full_rebuild);
+    // Seed a known valid forest to make exact repair regions independent of
+    // METIS version/partition choices. Subsequent repairs use the real ND path.
+    reuse.tree = test_temporal_tree<Int>();
+    auto before = reuse.tree;
+    size_t subtrees = 0, vertices = 0;
+    bool full = false;
+    SECTION("unchanged") {}
+    SECTION("deletion") { edges.clear(); }
+    SECTION("within node") { edges.emplace_back(0, 1); }
+    SECTION("ancestor") { edges.emplace_back(13, 0); }
+    SECTION("siblings") { edges.emplace_back(0, 2); subtrees = 1; vertices = 6; }
+    SECTION("duplicates") { edges.emplace_back(0, 2); edges.emplace_back(1, 3); subtrees = 1; vertices = 6; }
+    SECTION("disjoint") { edges.emplace_back(0, 2); edges.emplace_back(14, 16); subtrees = 2; vertices = 12; }
+    SECTION("nested") { edges.emplace_back(0, 2); edges.emplace_back(0, 6); subtrees = 1; vertices = 14; }
+    SECTION("disconnected replacement") { edges = {{0, 2}}; subtrees = 1; vertices = 6; }
+    SECTION("root") { edges.emplace_back(0, 14); full = true; vertices = 30; }
+    auto dirty = [&] { Graph<Int> g(30, edges); return before.dirty_subtrees(g.p.data(), g.i.data()); }();
+    Graph<Int> changed(30, edges);
+    order(changed);
+    REQUIRE(reuse.statistics.full_rebuild == full);
+    REQUIRE(reuse.statistics.recomputed_subtrees == subtrees);
+    REQUIRE(reuse.statistics.repartitioned_vertices == vertices);
+    REQUIRE(reuse.incremental_analyses_since_rebuild == (full ? 0 : 1));
+    REQUIRE(reuse.statistics.nd_seconds >= 0);
+    if (!full) {
+        std::set<Int> replaced;
+        for (Int r : dirty.roots) for (Int c : before.subtree_nodes(r)) replaced.insert(c);
+        for (size_t v = 0; v < before.member.size(); ++v)
+            if (!replaced.count(before.member[v])) REQUIRE(reuse.tree.member[v] == before.member[v]);
+        for (size_t c = 0; c < before.nodes.size(); ++c) {
+            if (replaced.count(Int(c))) REQUIRE_FALSE(reuse.tree.nodes[c].alive);
+            else {
+                REQUIRE(reuse.tree.nodes[c].alive);
+                REQUIRE(reuse.tree.nodes[c].separator_vertices == before.nodes[c].separator_vertices);
+                REQUIRE(reuse.tree.nodes[c].parent == before.nodes[c].parent);
+            }
+        }
+    }
+    const auto last_parent = parent, last_member = member;
+    order(changed);
+    REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    REQUIRE(reuse.statistics.repartitioned_vertices == 0);
+    REQUIRE(parent == last_parent);
+    REQUIRE(member == last_member);
+}
+
+TEMPLATE_TEST_CASE("temporal ND rebuild period and cache lifetime", "[temporal_nd]", int32_t, int64_t) {
+    using Int = TestType;
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    common.value.method[0].nd_small = 4;
+    common.value.method[0].nd_components = 1;
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 2;
+    std::vector<Int> parent(30), member(30), perm(30);
+    Graph<Int> graph(30, test_temporal_edges<Int>());
+    auto order = [&](const Graph<Int> &g) {
+        auto nc = nested_dissection_from_graph<Int>(g.view, perm.data(), parent.data(), member.data(), &common.value, &reuse);
+        REQUIRE(nc > 0);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        return nc;
+    };
+    order(graph);
+    auto initial_parent = parent, initial_member = member, initial_perm = perm;
+    for (size_t call = 1; call <= 2; ++call) {
+        order(graph);
+        REQUIRE_FALSE(reuse.statistics.full_rebuild);
+        REQUIRE(reuse.incremental_analyses_since_rebuild == call);
+        REQUIRE(reuse.statistics.repartitioned_vertices == 0);
+        REQUIRE(parent == initial_parent);
+        REQUIRE(member == initial_member);
+        REQUIRE(perm == initial_perm);
+    }
+    order(graph);
+    REQUIRE(reuse.statistics.full_rebuild);
+    REQUIRE(reuse.incremental_analyses_since_rebuild == 0);
+    SECTION("dimension change") { Graph<Int> smaller(29, {}); order(smaller); REQUIRE(reuse.statistics.full_rebuild); }
+    SECTION("empty graph clears history") {
+        Graph<Int> empty(0, {});
+        order(empty);
+        REQUIRE(reuse.tree.nodes.empty());
+        order(graph);
+        REQUIRE(reuse.statistics.full_rebuild);
+    }
+    SECTION("all dense quick return seeds a reusable tree") {
+        common.value.method[0].prune_dense = -1;
+        Graph<Int> dense(4, {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}});
+        REQUIRE(order(dense) == 1);
+        REQUIRE(reuse.statistics.full_rebuild);
+        REQUIRE(reuse.tree.nodes.size() == 1);
+        REQUIRE(order(dense) == 1);
+        REQUIRE_FALSE(reuse.statistics.full_rebuild);
+        Graph<Int> deleted(4, {});
+        REQUIRE(order(deleted) == 1);
+        REQUIRE(reuse.statistics.repartitioned_vertices == 0);
+    }
+    SECTION("settings change") { common.value.method[0].nd_compress ^= 1; order(graph); REQUIRE(reuse.statistics.full_rebuild); }
+    SECTION("explicit reset") { reuse.reset(); order(graph); REQUIRE(reuse.statistics.full_rebuild); }
+    SECTION("disabled") {
+        reuse.temporal_reuse_period = 0;
+        order(graph);
+        REQUIRE(reuse.tree.nodes.empty());
+        REQUIRE(perm == initial_perm);
+        reuse.temporal_reuse_period = 2;
+        order(graph);
+        REQUIRE(reuse.statistics.full_rebuild);
+    }
+    SECTION("failure retains previous successful tree") {
+        { Environment invalid("CHOLMOD_NESDIS_NUM_THREADS", "invalid");
+          REQUIRE(nested_dissection_from_graph<Int>(graph.view, perm.data(), parent.data(), member.data(), &common.value, &reuse) < 0); }
+        REQUIRE(reuse.incremental_analyses_since_rebuild == 0);
+        order(graph);
+        REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    }
+    SECTION("edge connects forest roots") {
+        Graph<Int> disconnected(30, {});
+        reuse.reset();
+        order(disconnected);
+        REQUIRE(reuse.tree.roots.size() > 1);
+        Int a = reuse.tree.nodes[reuse.tree.roots[0]].separator_vertices.front();
+        Int b = reuse.tree.nodes[reuse.tree.roots[1]].separator_vertices.front();
+        Graph<Int> connected(30, {{a, b}});
+        auto nc = order(connected);
+        REQUIRE(reuse.statistics.full_rebuild);
+        check_separator_forest(connected, Int(nc), parent, member, perm);
+    }
+}
+
+TEMPLATE_TEST_CASE("temporal ND matrix API preserves symmetric and AAT semantics", "[temporal_nd]", int32_t, int64_t) {
+    using Int = TestType;
+    const bool aat = GENERATE(false, true);
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    common.value.method[0].nd_small = 4;
+    common.value.method[0].nd_camd = GENERATE(0, 1, 2);
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 2;
+    auto edges = test_temporal_edges<Int>();
+    std::vector<Int> parent(30), member(30), perm(30);
+    for (int step = 0; step < 8; ++step) {
+        if (step == 2) edges.emplace_back(0, 2);
+        if (step == 4) edges.emplace_back(0, 14);
+        if (step == 6) edges.clear();
+        Graph<Int> matrix(30, edges);
+        if (!aat) matrix.view.stype = 1;
+        std::vector<std::pair<Int, Int>> product;
+        if (aat) {
+            for (Int col = 0; col < 30; ++col)
+                for (Int a = matrix.p[col]; a < matrix.p[col + 1]; ++a)
+                    for (Int b = a + 1; b < matrix.p[col + 1]; ++b)
+                        product.emplace_back(matrix.i[a], matrix.i[b]);
+        }
+        Graph<Int> graph(30, aat ? product : edges);
+        auto nc = nested_dissection<Int>(&matrix.view, nullptr, 0, perm.data(), parent.data(), member.data(), &common.value, reuse);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        check_separator_forest(graph, Int(nc), parent, member, perm);
+        if (step == 0) REQUIRE(reuse.statistics.full_rebuild);
+        if (step == 1) REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    }
+}
+
+#if MESHFEM_WITH_CATAMARI && !MESHFEM_USE_LEGACY_CATAMARI
+TEST_CASE("Catamari temporal ND history survives symbolic analyses and resets for pin changes", "[temporal_nd][catamari]") {
+    Environment threads("CHOLMOD_NESDIS_NUM_THREADS", "4");
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    CatamariFactorizer factorizer(false, GENERATE(false, true));
+    factorizer.orderingMethod = CatamariFactorizer::OrderingMethod::CholmodNesdisParallel;
+    factorizer.setTemporalReusePeriod(2);
+    REQUIRE(factorizer.temporalReusePeriod() == 2);
+    const int n = 256, side = 16;
+    std::vector<std::pair<int, int>> edges;
+    for (int v = 0; v < n; ++v) {
+        if (v % side + 1 < side) edges.emplace_back(v, v + 1);
+        if (v + side < n) edges.emplace_back(v, v + side);
+    }
+    for (int step = 0; step < 9; ++step) {
+        CAPTURE(step);
+        if (step == 4) edges.emplace_back(0, n - 1);
+        MeshFEM::TripletMatrix<> triplets(n, n);
+        for (int v = 0; v < n; ++v) triplets.addNZ(v, v, 10);
+        for (auto [a, b] : edges) { triplets.addNZ(a, b, -1); triplets.addNZ(b, a, -1); }
+        MeshFEM::SuiteSparseMatrix full(triplets);
+        auto matrix = full.toSymmetryMode(MeshFEM::SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE);
+        std::vector<size_t> pins;
+        if (step >= 5) pins = {size_t(step <= 6 ? 0 : 1)};
+        factorizer.factorizeSymbolic(matrix, pins);
+        const auto &statistics = factorizer.temporalReuseStatistics();
+        if (step == 0 || step == 3 || step == 5 || step == 7) REQUIRE(statistics.full_rebuild);
+        if (step == 1 || step == 2 || step == 6 || step == 8) {
+            REQUIRE_FALSE(statistics.full_rebuild);
+            REQUIRE(statistics.repartitioned_vertices == 0);
+        }
+        factorizer.factorizeNumeric(matrix);
+        Eigen::VectorXd expected = Eigen::VectorXd::LinSpaced(n, -1, 1);
+        for (size_t v : pins) expected[v] = 0;
+        Eigen::VectorXd rhs = matrix.apply(expected);
+        REQUIRE((factorizer.solve(rhs) - expected).norm() < 1e-5 * expected.norm());
+    }
+}
+#endif
+
+TEMPLATE_TEST_CASE("temporal ND repeatedly splices real parallel separator trees", "[temporal_nd]", int32_t, int64_t) {
+    using Int = TestType;
+    Environment threads("CHOLMOD_NESDIS_NUM_THREADS", "4");
+    Environment serial_size("CHOLMOD_NESDIS_SERIAL_SUBTREE_SIZE", "32");
+#ifdef MESHFEM_WITH_SCOTCH
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", GENERATE("0", "2"));
+#else
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+#endif
+    Environment scotch_threads("CHOLMOD_NESDIS_SCOTCH_THREADS", "1");
+    Environment verify("CHOLMOD_NESDIS_CAMD_VERIFY", "1");
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    common.value.method[0].nd_small = 8;
+    common.value.method[0].nd_compress = GENERATE(0, 1);
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 8;
+    const Int side = 32, n = side * side;
+    std::vector<std::pair<Int, Int>> edges;
+    for (Int v = 0; v < n; ++v) {
+        if (v % side + 1 < side) edges.emplace_back(v, v + 1);
+        if (v + side < n) edges.emplace_back(v, v + side);
+    }
+    std::vector<Int> perm(n), parent(n), member(n);
+    size_t incremental_repairs = 0;
+    for (int step = 0; step < 18; ++step) {
+        CAPTURE(step);
+        if (step % 3 == 1) {
+            // Select two large, disjoint, non-root regions from the current
+            // METIS/Scotch tree, then connect distinct children in each.
+            std::vector<std::pair<size_t, Int>> candidates;
+            for (size_t c = 0; c < reuse.tree.nodes.size(); ++c) {
+                const auto &node = reuse.tree.nodes[c];
+                if (node.alive && node.parent >= 0 && node.children.size() >= 2)
+                    candidates.emplace_back(reuse.tree.subtree_vertices(Int(c)).size(), Int(c));
+            }
+            std::sort(candidates.rbegin(), candidates.rend());
+            std::vector<Int> selected;
+            for (auto [size, c] : candidates) {
+                bool overlaps = false;
+                for (Int r : selected) {
+                    Int lca = reuse.tree.lca(c, r);
+                    overlaps |= lca == c || lca == r;
+                }
+                if (overlaps) continue;
+                selected.push_back(c);
+                const auto &children = reuse.tree.nodes[c].children;
+                edges.emplace_back(reuse.tree.subtree_vertices(children[0]).front(),
+                                   reuse.tree.subtree_vertices(children[1]).front());
+                if (selected.size() == 2) break;
+            }
+            REQUIRE(selected.size() == 2);
+        }
+        if (step % 3 == 2 && !edges.empty()) edges.pop_back();
+        Graph<Int> graph(n, edges);
+        const bool due = reuse.tree.roots.empty() || reuse.incremental_analyses_since_rebuild == reuse.temporal_reuse_period;
+        auto dirty = due ? typename PersistentSeparatorTree<Int>::DirtySubtrees{}
+                         : reuse.tree.dirty_subtrees(graph.p.data(), graph.i.data());
+        const bool full = due || dirty.full_rebuild;
+        size_t vertices = full ? size_t(n) : 0;
+        if (!full) for (Int r : dirty.roots) vertices += reuse.tree.subtree_vertices(r).size();
+        auto nc = nested_dissection_from_graph<Int>(graph.view, perm.data(), parent.data(), member.data(), &common.value, &reuse);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        check_separator_forest(graph, Int(nc), parent, member, perm);
+        REQUIRE(reuse.statistics.full_rebuild == full);
+        REQUIRE(reuse.statistics.repartitioned_vertices == vertices);
+        if (!full) REQUIRE(reuse.statistics.recomputed_subtrees == dirty.roots.size());
+        if (!full && !dirty.roots.empty()) ++incremental_repairs;
+    }
+    REQUIRE(incremental_repairs >= 4);
+}
+
+TEMPLATE_TEST_CASE("temporal ND repairs rectangular matrix products with changing column subsets", "[temporal_nd]", int32_t, int64_t) {
+    using Int = TestType;
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    common.value.method[0].nd_small = 4;
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 8;
+    auto edges = test_temporal_edges<Int>();
+    std::reverse(edges.begin(), edges.end());
+    std::vector<Int> perm(30), parent(30), member(30);
+    for (int step = 0; step < 3; ++step) {
+        if (step == 1) { edges.emplace_back(0, 2); edges.emplace_back(14, 16); }
+        // One incidence column per edge makes A*A' exactly the test graph.
+        std::vector<Int> p{0}, i;
+        for (auto [a, b] : edges) {
+            i.push_back(std::min(a, b));
+            if (a != b) i.push_back(std::max(a, b));
+            p.push_back(Int(i.size()));
+        }
+        cholmod_sparse A{};
+        A.nrow = 30; A.ncol = edges.size(); A.nzmax = i.size();
+        A.p = p.data(); A.i = i.data();
+        A.packed = A.sorted = 1;
+        A.itype = common.value.itype; A.xtype = CHOLMOD_PATTERN;
+        // Initially exclude the two new columns, then include them to trigger
+        // two disjoint induced-graph repairs through the A*A' entry point.
+        std::vector<Int> fset(edges.size() - (step == 1 ? 2 : 0));
+        std::iota(fset.begin(), fset.end(), Int(0));
+        auto nc = nested_dissection<Int>(&A, fset.data(), fset.size(), perm.data(), parent.data(), member.data(), &common.value, reuse);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        auto expected_edges = edges;
+        if (step == 1) expected_edges.resize(expected_edges.size() - 2);
+        Graph<Int> expected(30, expected_edges);
+        check_separator_forest(expected, Int(nc), parent, member, perm);
+        if (step == 0) reuse.tree = test_temporal_tree<Int>();
+        if (step == 1) REQUIRE(reuse.statistics.repartitioned_vertices == 0);
+        if (step == 2) {
+            REQUIRE_FALSE(reuse.statistics.full_rebuild);
+            REQUIRE(reuse.statistics.recomputed_subtrees == 2);
+            REQUIRE(reuse.statistics.repartitioned_vertices == 12);
+        }
+    }
+}
+
+TEMPLATE_TEST_CASE("temporal ND repairs forest roots independently", "[temporal_nd]", int32_t, int64_t) {
+    using Int = TestType;
+    Environment threads("CHOLMOD_NESDIS_NUM_THREADS", GENERATE("1", "4"));
+    Environment serial_size("CHOLMOD_NESDIS_SERIAL_SUBTREE_SIZE", "4");
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    Environment camd("CHOLMOD_NESDIS_CAMD_CUT_DEPTH", GENERATE("-1", "4"));
+    Environment verify("CHOLMOD_NESDIS_CAMD_VERIFY", "1");
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    common.value.method[0].nd_small = 4;
+    common.value.method[0].nd_components = 1;
+    common.value.method[0].nd_compress = GENERATE(0, 1);
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 8;
+    const auto tree = test_temporal_tree<Int>();
+    std::vector<Int> parent(90), member(90), perm(90);
+    std::vector<std::pair<Int, Int>> edges;
+    for (Int t = 0; t < 3; ++t)
+        for (auto [a, b] : test_temporal_edges<Int>()) edges.emplace_back(a + 30 * t, b + 30 * t);
+    auto order = [&](const Graph<Int> &graph) {
+        auto nc = nested_dissection_from_graph<Int>(graph.view, perm.data(), parent.data(), member.data(), &common.value, &reuse);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        check_separator_forest(graph, Int(nc), parent, member, perm);
+        return nc;
+    };
+    Graph<Int> initial(90, edges);
+    order(initial);
+    // Three known trees make the intended dirty roots independent of the
+    // bisector's choices; repair still runs through the real parallel ND path.
+    for (Int c = 0; c < 45; ++c) {
+        Int p = tree.nodes[c % 15].parent;
+        parent[c] = p < 0 ? -1 : p + 15 * (c / 15);
+    }
+    for (Int v = 0; v < 90; ++v) member[v] = v / 2;
+    reuse.tree = PersistentSeparatorTree<Int>::from_cholmod(90, 45, parent.data(), member.data());
+    const auto before = reuse.tree;
+    REQUIRE(before.roots == std::vector<Int>{14, 29, 44});
+    std::vector<Int> expected;
+    bool full = false, disconnected = false;
+    SECTION("first root") { edges.emplace_back(0, 14); expected = {14}; }
+    SECTION("middle root") { edges.emplace_back(30, 44); expected = {29}; }
+    SECTION("last root") { edges.emplace_back(60, 74); expected = {44}; }
+    SECTION("two roots") {
+        edges.emplace_back(0, 14); edges.emplace_back(60, 74); expected = {14, 44};
+    }
+    SECTION("root and subtree in another tree") {
+        edges.emplace_back(0, 14); edges.emplace_back(30, 32); expected = {14, 17};
+    }
+    SECTION("root subsumes descendant") {
+        edges.emplace_back(0, 2); edges.emplace_back(0, 14); expected = {14};
+    }
+    SECTION("root splits into multiple roots") {
+        edges.erase(std::remove_if(edges.begin(), edges.end(), [](auto e) { return e.first < 30; }), edges.end());
+        edges.emplace_back(0, 14); expected = {14}; disconnected = true;
+    }
+    SECTION("cross-tree edge still forces full ND") {
+        edges.emplace_back(0, 30); full = true;
+    }
+    Graph<Int> changed(90, edges);
+    auto dirty = before.dirty_subtrees(changed.p.data(), changed.i.data());
+    REQUIRE(dirty.full_rebuild == full);
+    REQUIRE(dirty.roots == expected);
+    size_t vertices = full ? 90 : 0;
+    std::set<Int> replaced;
+    for (Int r : expected) {
+        vertices += before.subtree_vertices(r).size();
+        for (Int c : before.subtree_nodes(r)) replaced.insert(c);
+    }
+    auto nc = order(changed);
+    REQUIRE(reuse.statistics.full_rebuild == full);
+    REQUIRE(reuse.statistics.recomputed_subtrees == expected.size());
+    REQUIRE(reuse.statistics.repartitioned_vertices == vertices);
+    REQUIRE(reuse.incremental_analyses_since_rebuild == (full ? 0 : 1));
+    if (!full) {
+        for (Int c = 0; c < 45; ++c) {
+            if (replaced.count(c)) REQUIRE_FALSE(reuse.tree.nodes[c].alive);
+            else {
+                REQUIRE(reuse.tree.nodes[c].alive);
+                REQUIRE(reuse.tree.nodes[c].parent == before.nodes[c].parent);
+                REQUIRE(reuse.tree.nodes[c].separator_vertices == before.nodes[c].separator_vertices);
+                REQUIRE(reuse.tree.depth[c] == before.depth[c]);
+            }
+        }
+        for (Int v = 0; v < 90; ++v)
+            if (!replaced.count(before.member[v])) REQUIRE(reuse.tree.member[v] == before.member[v]);
+        for (Int r : before.roots)
+            if (!replaced.count(r)) REQUIRE(std::count(reuse.tree.roots.begin(), reuse.tree.roots.end(), r) == 1);
+        for (Int r : reuse.tree.roots) {
+            REQUIRE(reuse.tree.nodes[r].alive);
+            REQUIRE(reuse.tree.nodes[r].parent == -1);
+            REQUIRE(reuse.tree.depth[r] == 0);
+        }
+        if (disconnected) REQUIRE(reuse.tree.roots.size() > before.roots.size());
+    }
+    const auto last_parent = parent, last_member = member;
+    REQUIRE(order(changed) == nc);
+    REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    REQUIRE(reuse.statistics.repartitioned_vertices == 0);
+    REQUIRE(std::equal(parent.begin(), parent.begin() + nc, last_parent.begin()));
+    REQUIRE(member == last_member);
+}

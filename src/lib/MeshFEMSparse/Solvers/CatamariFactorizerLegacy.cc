@@ -72,6 +72,7 @@ void CatamariFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const s
 // uniform block size `m_blockSize`.
 // `pinnedVars` always holds scalar variables.
 void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars) {
+    m_prepareTemporalReuse(pinnedVars);
     const SuiteSparseMatrix *A_reduced;
     std::vector<SuiteSparse_long> reducedRowForRow_block;
     std::vector<SuiteSparse_long> blockEntryForReducedBlockEntry; // the original block nz corresponding to each nz in the block row-col-removed matrix

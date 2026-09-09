@@ -24,12 +24,33 @@ public:
     enum class Method { AMD, NestedDissection, ParallelNestedDissection, Metis };
 
     void setNestedDissectionCompression(bool enabled) {
+        if (m_ndCompress != enabled) resetTemporalReuse();
         m_ndCompress = enabled;
 #if MESHFEM_WITH_CHOLMOD
         if (m_c)     m_c->method[0].nd_compress = enabled;
         if (m_c_int) m_c_int->method[0].nd_compress = enabled;
 #endif
     }
+
+    void setTemporalReusePeriod(size_t period) {
+        if (m_temporalReusePeriod != period) resetTemporalReuse();
+        m_temporalReusePeriod = period;
+#if MESHFEM_WITH_CHOLMOD
+        m_reuseLong.temporal_reuse_period = m_reuseInt.temporal_reuse_period = period;
+#endif
+    }
+    size_t temporalReusePeriod() const { return m_temporalReusePeriod; }
+    void resetTemporalReuse() {
+#if MESHFEM_WITH_CHOLMOD
+        m_reuseLong.reset();
+        m_reuseInt.reset();
+#endif
+    }
+#if MESHFEM_WITH_CHOLMOD
+    const CholmodParallelNesdis::TemporalReuseStatistics &temporalReuseStatistics() const {
+        return m_lastLong ? m_reuseLong.statistics : m_reuseInt.statistics;
+    }
+#endif
 
     // Contiguous column groups in permutation order, with child-before-parent
     // dependencies. These are scheduling groups, not fundamental supernodes.
@@ -54,6 +75,7 @@ public:
         static_assert(std::is_same_v<Index, SuiteSparse_long> || std::is_same_v<Index, int>,
                       "CholmodOrdering supports only SuiteSparse_long and int indices.");
         if (forest) *forest = {};
+        if (method != Method::ParallelNestedDissection) resetTemporalReuse();
 #if MESHFEM_WITH_CHOLMOD
         if (fullPattern && method == Method::ParallelNestedDissection) {
             if (fullPattern->m != A.m || fullPattern->n != A.n)
@@ -72,8 +94,19 @@ public:
 
 private:
     bool m_ndCompress = true;
+    size_t m_temporalReusePeriod = 0;
 #if MESHFEM_WITH_CHOLMOD
     std::unique_ptr<cholmod_common> m_c, m_c_int;
+    CholmodParallelNesdis::TemporalReuseState<int64_t> m_reuseLong;
+    CholmodParallelNesdis::TemporalReuseState<int32_t> m_reuseInt;
+    bool m_lastLong = true;
+
+    template<class Index>
+    auto &reuseState() {
+        m_lastLong = sizeof(Index) == 8;
+        if constexpr (sizeof(Index) == 8) return m_reuseLong;
+        else return m_reuseInt;
+    }
 
     void configure_common(cholmod_common *c) {
         c->method[0].nd_compress = m_ndCompress;
@@ -161,7 +194,7 @@ private:
         graph.stype = 0;
         VecX_T<Index> perm(A.n), parent(A.n), member(A.n);
         auto nc = CholmodParallelNesdis::nested_dissection_from_graph<Index>(
-            graph, perm.data(), parent.data(), member.data(), common);
+            graph, perm.data(), parent.data(), member.data(), common, &reuseState<Index>());
         if (nc < 0) throw std::runtime_error("Parallel CHOLMOD nested dissection from full graph failed.");
         if (forest) *forest = extractAssemblyForest(perm, parent, member, nc);
         return perm;
@@ -239,8 +272,8 @@ private:
 #else
                 BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_l_nested_dissection_parallel");
                 VecX_T<SuiteSparse_long> CParent(A.m), CMember(A.m);
-                auto nc = cholmod_l_nested_dissection_parallel(&cholmat, /* fset = */ nullptr, /* fsize = */ 0,
-                                                     iperm.data(), CParent.data(), CMember.data(), commonLong());
+                auto nc = CholmodParallelNesdis::nested_dissection<SuiteSparse_long>(&cholmat, /* fset = */ nullptr, /* fsize = */ 0,
+                                                     iperm.data(), CParent.data(), CMember.data(), commonLong(), reuseState<SuiteSparse_long>());
                 if (nc < 0)
                     throw std::runtime_error("Parallel CHOLMOD nested dissection failed.");
                 if (forest) *forest = extractAssemblyForest(iperm, CParent, CMember, nc);
@@ -296,8 +329,8 @@ private:
 #else
                 BENCHMARK_SCOPED_TIMER_SECTION t("cholmod_nested_dissection_parallel");
                 VecX_T<int> CParent(A.m), CMember(A.m);
-                auto nc = cholmod_nested_dissection_parallel(&cholmat, /* fset = */ nullptr, /* fsize = */ 0,
-                                                  iperm.data(), CParent.data(), CMember.data(), commonInt());
+                auto nc = CholmodParallelNesdis::nested_dissection<int>(&cholmat, /* fset = */ nullptr, /* fsize = */ 0,
+                                                  iperm.data(), CParent.data(), CMember.data(), commonInt(), reuseState<int>());
                 if (nc < 0)
                     throw std::runtime_error("Parallel CHOLMOD nested dissection failed.");
                 if (forest) *forest = extractAssemblyForest(iperm, CParent, CMember, nc);
