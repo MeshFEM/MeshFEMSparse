@@ -284,13 +284,12 @@ struct CholeskyFactorizerBase {
     // `permute`: whether to also apply the permutation/inverse permutation in a fused operation.
     template<class VecIn, class VecOut>
     void extractFullSolution(const VecIn &xReduced, VecOut &&x, bool permute = false) const {
-        if (!hasFixedVars()) {
-            if (permute) throw std::runtime_error("Unimplemented");
+        if (!hasFixedVars() && !permute) {
             x = xReduced;
             return;
         }
 
-        if (m_reducedRowForRow.size() != n()) throw std::logic_error("Variables were not fixed");
+        if (hasFixedVars() && m_reducedRowForRow.size() != n()) throw std::logic_error("Variables were not fixed");
         if (size_t(xReduced.rows()) != n_reduced()) throw std::runtime_error("Invalid xReduced size");
         x.resize(n(), xReduced.cols());
 
@@ -319,13 +318,12 @@ struct CholeskyFactorizerBase {
 
     template<class VecIn, class VecOut>
     void removeFixedEntries(const VecIn &x, VecOut &&xReduced, bool permute = false) const {
-        if (!hasFixedVars()) {
-            if (permute) throw std::runtime_error("Unimplemented");
+        if (!hasFixedVars() && !permute) {
             xReduced = x;
             return;
         }
 
-        if (m_reducedRowForRow.size() != n()) throw std::logic_error("Variables were not fixed");
+        if (hasFixedVars() && m_reducedRowForRow.size() != n()) throw std::logic_error("Variables were not fixed");
         if (size_t(x.rows()) != n()) throw std::runtime_error("Invalid x size");
 
         const SuiteSparse_long *reducedRowForRow = m_reducedRowForRow.data();

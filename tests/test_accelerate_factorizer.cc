@@ -11,9 +11,11 @@ namespace {
 template<class Matrix>
 void checkAccelerateSolves(const Matrix &A, const SuiteSparseMatrix &scalarA,
                           bool singlePrecision, const std::vector<size_t> &pins,
-                          bool useBlockAccel = true) {
+                          bool useBlockAccel = true,
+                          AccelerateFactorizer::OrderingMethod ordering = AccelerateFactorizer::OrderingMethod::Metis) {
     AccelerateFactorizer factorizer(singlePrecision);
     factorizer.setUseBlockAccel(useBlockAccel);
+    factorizer.orderingMethod = ordering;
     Eigen::VectorXd expected = Eigen::VectorXd::LinSpaced(scalarA.n, -0.5, 1.0);
     for (size_t i : pins) expected[i] = 0.0;
     const double tolerance = singlePrecision ? 1e-5 : 1e-12;
@@ -38,6 +40,8 @@ void checkAccelerateSolves(const Matrix &A, const SuiteSparseMatrix &scalarA,
 
 TEST_CASE("Accelerate solves in double and single precision", "[accelerate]") {
     const bool singlePrecision = GENERATE(false, true);
+    const auto ordering = GENERATE(AccelerateFactorizer::OrderingMethod::Metis,
+                                   AccelerateFactorizer::OrderingMethod::CholmodNesdisParallel);
     const auto pins = GENERATE(std::vector<size_t>{}, std::vector<size_t>{0, 1}, std::vector<size_t>{1});
 
     // Strict diagonal dominance gives a well-conditioned SPD system with
@@ -50,7 +54,7 @@ TEST_CASE("Accelerate solves in double and single precision", "[accelerate]") {
     scalarA.symmetry_mode = SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE;
 
     SECTION("scalar matrix") {
-        checkAccelerateSolves(scalarA, scalarA, singlePrecision, pins);
+        checkAccelerateSolves(scalarA, scalarA, singlePrecision, pins, true, ordering);
     }
     SECTION("block matrix") {
         SystemAssembler<2> assembler(3);
@@ -62,10 +66,10 @@ TEST_CASE("Accelerate solves in double and single precision", "[accelerate]") {
             A->addNZScalar(entry.i, entry.j, entry.value());
 
         SECTION("native blocks with scalar fallback for partial pins") {
-            checkAccelerateSolves(*A, scalarA, singlePrecision, pins);
+            checkAccelerateSolves(*A, scalarA, singlePrecision, pins, true, ordering);
         }
         SECTION("explicit scalar conversion") {
-            checkAccelerateSolves(*A, scalarA, singlePrecision, pins, false);
+            checkAccelerateSolves(*A, scalarA, singlePrecision, pins, false, ordering);
         }
     }
 }

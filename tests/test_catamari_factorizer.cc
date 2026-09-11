@@ -3,8 +3,11 @@
 #include <MeshFEMSparse/Solvers/make_cholesky_factorizer.hh>
 #include <MeshFEMSparse/SystemAssembler.hh>
 #include <catch2/catch.hpp>
+#include <tbb/global_control.h>
 
 using namespace MeshFEM;
+#include <catamari/norms.hpp>
+#include <catamari/sparse_ldl.hpp>
 
 namespace {
 template<class Matrix>
@@ -36,7 +39,6 @@ void checkSolves(Matrix &A, const SuiteSparseMatrix &scalarA, bool single,
         Eigen::VectorXd b0 = b.col(0), x0 = f.solve(b0);
         REQUIRE((x0 - expected.col(0)).norm() < tol * expected.col(0).norm());
         for (bool permuted : {false, true}) {
-            if (permuted && pins.empty()) continue;
             Eigen::VectorXd reduced, reducedX(f.n_reduced()), full;
             f.removeFixedEntries(b0, reduced, permuted);
             f.solveRawReduced(reduced.data(), reducedX.data(), CholeskySys::A, permuted);
@@ -164,6 +166,34 @@ TEST_CASE("Catamari precision factory rejects legacy mode", "[catamari][precisio
     REQUIRE_THROWS_AS(make_cholesky_factorizer(CholeskyProvider::CatamariLegacy, true), std::invalid_argument);
 }
 
+TEST_CASE("Catamari solve traversal survives changes to a separator forest", "[catamari][solve_kernels]") {
+    tbb::global_control limit(tbb::global_control::max_allowed_parallelism, 4);
+    CatamariFactorizer factor;
+    factor.orderingMethod = CatamariFactorizer::OrderingMethod::CholmodNesdisParallel;
+    constexpr int side = 17, component_size = side * side, n = 2 * component_size;
+    for (bool connect : {false, true, false}) {
+        TripletMatrix<> triplets(n, n);
+        for (int i = 0; i < n; ++i) {
+            triplets.addNZ(i, i, 5.0);
+            if (i % side + 1 < side) triplets.addNZ(i, i + 1, -0.5);
+            if (i % component_size + side < component_size) triplets.addNZ(i, i + side, -0.5);
+        }
+        if (connect) triplets.addNZ(component_size - 1, component_size, -0.5);
+        SuiteSparseMatrix A(triplets);
+        A.symmetry_mode = SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE;
+        factor.factorizeSymbolic(A, {});
+        factor.factorizeNumeric(A);
+        Eigen::MatrixXd expected = Eigen::MatrixXd::Random(n, 3), rhs(n, 3), actual;
+        for (int j = 0; j < 3; ++j) rhs.col(j) = A.apply(Eigen::VectorXd(expected.col(j)));
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            factor.solveMultiRHS(rhs, actual);
+            REQUIRE((actual - expected).norm() < 1e-11 * expected.norm());
+            Eigen::VectorXd b = rhs.col(0);
+            REQUIRE((factor.solve(b) - expected.col(0)).norm() < 1e-11 * expected.col(0).norm());
+        }
+    }
+}
+
 TEST_CASE("Catamari handles rounding-induced loss of positive definiteness", "[catamari][precision]") {
     TripletMatrix<> t(2, 2);
     t.nz = {{0, 0, 1.0}, {0, 1, 1.0}, {1, 1, 1.0 + 1e-8}};
@@ -265,4 +295,121 @@ TEST_CASE("Catamari temporal ND uses the actual block size after scalar fallback
     }
 }
 #endif
+
+TEST_CASE("Catamari index arrays store one scalar base per block", "[catamari][block_indices]") {
+    using namespace catamari;
+    using namespace catamari::supernodal_ldl;
+    const Int d = GENERATE(1, 2, 3);
+    Buffer<Int> sizes(3), degrees(3), members(4 * d);
+    sizes[0] = d; sizes[1] = 2 * d; sizes[2] = d;
+    degrees[0] = 2 * d; degrees[1] = d; degrees[2] = 0;
+    BlasMatrix<double> storage;
+    storage.Resize(4 * d * d, 1);
+    LowerFactor<double> lower(sizes, degrees, storage.Submatrix(0, 0, 4 * d * d, 1), d);
+    REQUIRE(lower.IndexBlockSize() == d);
+    REQUIRE(lower.NumStructureEntries() == 3);
+    REQUIRE(lower.StructureEnd(0) - lower.StructureBeg(0) == 2);
+    REQUIRE(lower.StructureEnd(1) - lower.StructureBeg(1) == 1);
+    REQUIRE(lower.StructureEnd(2) == lower.StructureBeg(2));
+    lower.StructureBeg(0)[0] = d; lower.StructureBeg(0)[1] = 3 * d;
+    lower.StructureBeg(1)[0] = 3 * d;
+    for (Int i = 0; i < 4 * d; ++i) members[i] = i < d ? 0 : i < 3 * d ? 1 : 2;
+    lower.FillIntersectionSizes(sizes, members);
+    REQUIRE(lower.IntersectionSizesEnd(0) - lower.IntersectionSizesBeg(0) == 2);
+    REQUIRE(lower.IntersectionSizesBeg(0)[0] == d);
+    REQUIRE(lower.IntersectionSizesBeg(0)[1] == d);
+    for (Int c = 0; c < d; ++c) {
+        REQUIRE(lower.FindScalarRow(0, d + c) == c);
+        REQUIRE(lower.FindScalarRow(0, 3 * d + c) == d + c);
+        REQUIRE(lower.ScalarStructureBeg(0)[d + c] == 3 * d + c);
+    }
+    REQUIRE_THROWS(lower.FindScalarRow(0, 2 * d));
+    SymmetricOrdering ordering;
+    ordering.supernode_sizes = sizes;
+    ordering.supernode_offsets.Resize(4);
+    ordering.supernode_offsets[0] = 0; ordering.supernode_offsets[1] = d;
+    ordering.supernode_offsets[2] = 3 * d; ordering.supernode_offsets[3] = 4 * d;
+    auto &af = ordering.assembly_forest;
+    af.parents.Resize(3); af.parents[0] = 1; af.parents[1] = 2; af.parents[2] = -1;
+    constructChildToParentMap(ordering, &lower);
+    REQUIRE(af.child_rel_indices.Size() == 3);
+    REQUIRE(af.child_rel_indices_offsets[3] == 3);
+    REQUIRE(af.child_rel_indices[0] == 0);
+    REQUIRE(af.child_rel_indices[1] == 2 * d);
+    REQUIRE(af.child_rel_indices[2] == 0);
+    REQUIRE(af.num_child_diag_indices[0] == d);
+    REQUIRE(af.num_child_diag_indices[1] == d);
+    REQUIRE(af.num_child_diag_indices[2] == 0);
+}
+
+namespace {
+template<size_t BS>
+void checkBlockForest(bool single, bool left) {
+    constexpr int side = 13, component = side * side, n = 2 * component;
+    std::vector<std::array<size_t, 2>> edges;
+    for (size_t i = 0; i < n; ++i) {
+        if (i % side + 1 < side) edges.push_back({{i, i + 1}});
+        if (i % component + side < component) edges.push_back({{i, i + side}});
+    }
+    SystemAssembler<BS> assembler(n);
+    auto A = assembler.blockSparsityPattern(edges.size(), [&](size_t i) { return edges[i]; });
+    A->setZero();
+    for (auto e : A->toScalar())
+        A->addNZScalar(e.i, e.j, e.i == e.j ? 10.0 : -0.1);
+    const auto scalar = A->toScalar();
+    checkSolves(*A, scalar, single, left, CatamariFactorizer::OrderingMethod::CholmodNesdisParallel, {});
+}
+}
+
+TEST_CASE("Catamari compact block maps survive forest factorization and reuse", "[catamari][block_indices]") {
+    const bool single = GENERATE(false, true);
+    const bool left = GENERATE(false, true);
+    const int threads = GENERATE(1, 4);
+    tbb::global_control limit(tbb::global_control::max_allowed_parallelism, threads);
+    SECTION("two components per block") { checkBlockForest<2>(single, left); }
+    SECTION("three components per block") { checkBlockForest<3>(single, left); }
+}
+
+TEST_CASE("Catamari symbolic scaling never expands stored row indices", "[catamari][block_indices]") {
+    using namespace catamari;
+    using namespace catamari::supernodal_ldl;
+    const Int d = GENERATE(2, 3);
+    const auto algorithm = GENERATE(kLeftLookingLDL, kRightLookingLDL);
+    constexpr Int side = 13, n = side * side;
+    CoordinateMatrix<double> matrix;
+    matrix.Resize(n, n);
+    for (Int i = 0; i < n; ++i) {
+        matrix.QueueEntryAddition(i, i, 5.0);
+        for (Int j : {i % side + 1 < side ? i + 1 : -1, i + side < n ? i + side : -1}) {
+            if (j < 0) continue;
+            matrix.QueueEntryAddition(i, j, -0.5);
+            matrix.QueueEntryAddition(j, i, -0.5);
+        }
+    }
+    matrix.FlushEntryQueues();
+    Factorization<double> symbolic;
+    Control<double> control;
+    control.algorithm = algorithm;
+    symbolic.Factor(matrix, SymmetricOrdering{}, control, true);
+    auto &before = *symbolic.lower_factor_;
+    REQUIRE(before.NumStructureEntries() > 0);
+    constructChildToParentMap(symbolic.ordering_, &before);
+    auto scaled = symbolic.ExpandSymbolicFactorizationToScalar(d);
+    auto &after = *scaled->lower_factor_;
+    REQUIRE(after.IndexBlockSize() == d);
+    REQUIRE(after.NumStructureEntries() == before.NumStructureEntries());
+    constructChildToParentMap(scaled->ordering_, &after);
+    for (Int s = 0; s < Int(before.blocks.Size()); ++s) {
+        REQUIRE(after.blocks[s].height == d * before.blocks[s].height);
+        REQUIRE(after.blocks[s].width == d * before.blocks[s].width);
+        for (Int i = 0; i < before.blocks[s].height; ++i)
+            REQUIRE(after.StructureBeg(s)[i] == d * before.StructureBeg(s)[i]);
+        REQUIRE(scaled->ordering_.assembly_forest.num_child_diag_indices[s] ==
+                d * symbolic.ordering_.assembly_forest.num_child_diag_indices[s]);
+    }
+    const auto &old_map = symbolic.ordering_.assembly_forest.child_rel_indices;
+    const auto &new_map = scaled->ordering_.assembly_forest.child_rel_indices;
+    REQUIRE(new_map.Size() == old_map.Size());
+    for (Int i = 0; i < Int(old_map.Size()); ++i) REQUIRE(new_map[i] == d * old_map[i]);
+}
 #endif

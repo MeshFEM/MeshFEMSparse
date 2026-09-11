@@ -15,7 +15,7 @@ namespace MeshFEM {
 
 struct MESHFEM_EXPORT AccelerateFactorizer final : public CholeskyFactorizerBase {
     enum class OrderingMethod {
-        Metis, AMD, Nesdis, CholmodAMD
+        Metis, AMD, Nesdis, CholmodAMD, CholmodNesdisParallel
     };
 
     AccelerateFactorizer(bool singlePrecision = false);

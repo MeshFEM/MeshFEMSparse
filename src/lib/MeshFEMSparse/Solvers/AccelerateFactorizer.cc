@@ -165,6 +165,18 @@ void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &
         m_opts.orderMethod = SparseOrderUser;
         m_opts.order = m_customOrder.data();
     }
+    else if (orderingMethod == OrderingMethod::CholmodNesdisParallel) {
+        // Match Catamari's full block graph and parallel nested-dissection path.
+        auto fullPattern = A_reduced->toSymmetryModeImpl<SuiteSparse_long>(
+            SuiteSparseMatrix::SymmetryMode::NONE, [](size_t ii) { return ii; });
+        auto iperm = m_cholmodOrdering.inversePermutation<int>(*A_reduced,
+            CholmodOrdering::Method::ParallelNestedDissection, nullptr, &fullPattern);
+        m_customOrder.resize(iperm.size());
+        for (int i = 0; i < iperm.size(); ++i)
+            m_customOrder[iperm[i]] = i;
+        m_opts.orderMethod = SparseOrderUser;
+        m_opts.order = m_customOrder.data();
+    }
     else if (orderingMethod == OrderingMethod::Nesdis) {
         auto iperm = m_cholmodOrdering.inversePermutation<SuiteSparse_long>(*A_reduced, CholmodOrdering::Method::NestedDissection);
         m_customOrder.resize(iperm.size());

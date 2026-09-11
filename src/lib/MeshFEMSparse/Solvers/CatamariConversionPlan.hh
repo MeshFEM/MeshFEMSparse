@@ -98,6 +98,7 @@ ConversionPlan constructConversionPlan(const catamari::CoordinateMatrix<Field> &
             const Int supernode_end   = sno[supernode + 1];
             catamari::BlasMatrixView<Field>& db = df->blocks[supernode];
             catamari::BlasMatrixView<Field>& lb = lf->blocks[supernode];
+            const Int index_block_size = lf->IndexBlockSize();
             const Int *index_beg = lf->StructureBeg(supernode);
             const Int *index_end = lf->StructureEnd(supernode);
 
@@ -123,18 +124,20 @@ ConversionPlan constructConversionPlan(const catamari::CoordinateMatrix<Field> &
                         locForEntry = std::distance(f_vals, (const Field *) db.Pointer(i_rel, j_rel));
                     }
                     else {
-                        // Search [lf->structureBeg, lf->structureEnd) for value `i_perm`,
+                        // Search the compact row list for the scalar row's block base,
                         // first checking at `*guess` (which will be correct for consecutive
                         // strips of entries).
+                        const Int component = i_perm % index_block_size;
+                        const Int row_base = i_perm - component;
                         const Int *iter;
-                        if ((guess >= index_beg) && (guess < index_end) && (*guess == i_perm)) iter = guess;
+                        if (guess && (guess < index_end) && (*guess == row_base)) iter = guess;
                         else {
-                            iter = sb_lower_bound(index_beg, index_end, i_perm);
-                            if ((iter == index_end) || (*iter != i_perm)) throw std::runtime_error("Couldn't locate row index " + std::to_string(i_perm) + " in supernode " + std::to_string(supernode) + " containing rows in [" + std::to_string(*index_beg) + ", " +  std::to_string(*index_end) + ")");
+                            iter = sb_lower_bound(index_beg, index_end, row_base);
+                            if ((iter == index_end) || (*iter != row_base)) throw std::runtime_error("Couldn't locate row index " + std::to_string(i_perm) + " in supernode " + std::to_string(supernode));
                         }
-                        guess = iter + 1;
+                        guess = component + 1 < index_block_size ? iter : iter + 1;
 
-                        const Int i_rel = std::distance(index_beg, iter);
+                        const Int i_rel = index_block_size * std::distance(index_beg, iter) + component;
                         locForEntry = std::distance(f_vals, (const Field *) lb.Pointer(i_rel, j_rel));
                     }
 
@@ -581,12 +584,7 @@ void validate(const catamari::ConversionPlan &cplan, const catamari::SparseLDL<F
         }
         else {
             // lower factor
-            const Int *index_beg = lf->StructureBeg(s);
-            const Int *index_end = lf->StructureEnd(s);
-            auto iter = sb_lower_bound(index_beg, index_end, i_perm);
-            if ((iter == index_end) || (*iter != i_perm)) throw std::runtime_error("Couldn't locate row index " + std::to_string(i_perm) + " in supernode " + std::to_string(s) + " containing rows in [" + std::to_string(*index_beg) + ", " +  std::to_string(*index_end) + ")");
-
-            Int i_rel = std::distance(index_beg, iter);
+            Int i_rel = lf->FindScalarRow(s, i_perm);
             assert(i_rel < lb.LeadingDimension());
             dst = std::distance(f_vals, (const Field *) lb.Pointer(i_rel, j_rel));
         }

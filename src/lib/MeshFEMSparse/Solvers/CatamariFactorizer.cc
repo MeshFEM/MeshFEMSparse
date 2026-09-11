@@ -550,9 +550,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
 
     std::unique_ptr<catamari::SparseLDL<Field>> ldl_block;
     if (m_blockSize > 1) {
-        // Currently we must expand the symbolic factorization to a scalar one.
-        // TODO: once a full "block factorization type" is supported,
-        // we can omit this conversion.
+        // Scale dense dimensions and permutations while retaining compact row indices.
         ldl_block = std::move(state.ldl);
         state.ldl = ldl_block->ExpandSymbolicFactorizationToScalar(m_blockSize);
     }
@@ -719,6 +717,23 @@ void CatamariFactorizer::writeSupernodeStats(const std::string &path) const {
     m_withState([&](auto &state) { state.ldl->supernodal_factorization->WriteSupernodeStats(path); });
 }
 
+
+void CatamariFactorizer::configureSolveProfile(bool enabled, int maxDepth, int minWidth) {
+    assertFactorization(FactorizationType::Numeric);
+    if (minWidth < 0) throw std::invalid_argument("Negative profile minimum width");
+    m_withState([&](auto &state) {
+        state.ldl->supernodal_factorization->ConfigureSolveProfile(enabled, maxDepth, minWidth);
+    });
+}
+void CatamariFactorizer::resetSolveProfile() {
+    assertFactorization(FactorizationType::Numeric);
+    m_withState([&](auto &state) { state.ldl->supernodal_factorization->ResetSolveProfile(); });
+}
+void CatamariFactorizer::writeSolveProfile(const std::string &path) const {
+    assertFactorization(FactorizationType::Numeric);
+    m_withState([&](auto &state) { state.ldl->supernodal_factorization->WriteSolveProfile(path); });
+}
+
 void CatamariFactorizer::writeSolveTimers() const {
 #if CATAMARI_FINEGRAINED_TIMERS
     static std::string directory = "catamari_solve_timers";
@@ -865,13 +880,14 @@ void CatamariFactorizer::solveMultiRHS(const Eigen::Matrix<Real, Eigen::Dynamic,
 
 void CatamariFactorizer::m_populatePermutedReducedRowForRow() const {
     const size_t n_full = n();
-    if (m_reducedRowForRow.size() != n_full) throw std::runtime_error("Incorrect m_reducedRowForRow size");
+    if (hasFixedVars() && m_reducedRowForRow.size() != n_full) throw std::runtime_error("Incorrect m_reducedRowForRow size");
     if (m_permutedReducedRowForRow.size() == n_full) return;
     const auto &o = m_ordering();
 
     m_permutedReducedRowForRow.resize(n_full);
     for (size_t i = 0; i < n_full; ++i) {
-        SuiteSparse_long row_orig = m_reducedRowForRow[i];
+        // With no fixed variables, this map is just the ordering permutation.
+        SuiteSparse_long row_orig = hasFixedVars() ? m_reducedRowForRow[i] : SuiteSparse_long(i);
         m_permutedReducedRowForRow[i] = (row_orig != SuiteSparseMatrix::INDEX_NONE)
                                             ? o.permutation[row_orig] : row_orig;
     }
