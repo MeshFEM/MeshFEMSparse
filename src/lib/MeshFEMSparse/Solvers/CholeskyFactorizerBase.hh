@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <cassert>
 #include <memory>
+#include <optional>
 #include <functional>
 #include <MeshFEMCore/Types.hh>
 #include <MeshFEMCore/GlobalBenchmark.hh>
@@ -17,7 +18,9 @@ namespace MeshFEM {
 
 enum class CholeskyProvider {
     CHOLMOD, Catamari, CatamariNesdis, CatamariNesdisParallel, CatamariMetis, CatamariLegacy, CatamariAMD, CatamariScotch, CatamariAdaptive, PARDISO, Accelerate,
-    CatamariNesdisReuse
+    CatamariNesdisReuse,
+    // Input matrix is already in its desired elimination order.
+    CatamariNative, CHOLMODNative
 };
 
 // Eigen provides a `swap` method rather than overloading `std::swap`
@@ -45,6 +48,16 @@ enum class CholeskySys { A, L, Lt, P, Pt };
 // pin constraints of the form:
 //      x[fixedVars] = 0
 struct CholeskyFactorizerBase {
+    // Separator tree from the most recent supported ND analysis. CMember is
+    // indexed by unpermuted REDUCED ordering variables (pins removed), not by
+    // factor columns. Each ordering variable represents blockSize scalar DOFs.
+    // Scalar analyses use blockSize=1. Unavailable for other ordering methods.
+    struct NDOrdering {
+        std::vector<SuiteSparse_long> CParent, CMember;
+        size_t blockSize = 1;
+    };
+    const std::optional<NDOrdering> &ndOrdering() const { return m_ndOrdering; }
+
     enum class FactorizationType : int {
         None = 0, Symbolic = 1, Numeric = 2
     };
@@ -369,6 +382,7 @@ struct CholeskyFactorizerBase {
     virtual void writeSolveTimers() const { /* Only some subclasses record timers */ }
 
 protected:
+    std::optional<NDOrdering> m_ndOrdering; // Reset before each symbolic analysis and when factors are cleared.
     FactorizationType m_factorizationType = FactorizationType::None;
 
     // Functionality for efficient solves under variable pins

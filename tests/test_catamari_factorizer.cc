@@ -125,7 +125,7 @@ void checkBlocks(bool single, bool left, CatamariFactorizer::OrderingMethod orde
 TEST_CASE("Catamari precision preserves scalar and block solver behavior", "[catamari][precision]") {
     const bool single = GENERATE(false, true);
     const bool left = GENERATE(false, true);
-    const auto ordering = GENERATE(CatamariFactorizer::OrderingMethod::AMD, CatamariFactorizer::OrderingMethod::CholmodNesdisParallel, CatamariFactorizer::OrderingMethod::Adaptive);
+    const auto ordering = GENERATE(CatamariFactorizer::OrderingMethod::Native, CatamariFactorizer::OrderingMethod::AMD, CatamariFactorizer::OrderingMethod::CholmodNesdisParallel, CatamariFactorizer::OrderingMethod::Adaptive);
     const int pinMode = GENERATE(0, 1, 2);
     const bool contiguous = GENERATE(false, true);
     SECTION("scalar blocks") { checkBlocks<1>(single, left, ordering, pinMode, contiguous, true); }

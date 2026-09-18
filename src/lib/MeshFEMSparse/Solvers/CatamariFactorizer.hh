@@ -39,7 +39,7 @@ using CatamariConverter = CatamariConverterT<double>;
 
 struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
     enum class OrderingMethod {
-        Catamari, CholmodNesdis, CholmodNesdisParallel, Metis, AMD, Adaptive, Scotch, AccelerateMetis, PardisoMetis, PardisoParallelMetis
+        Catamari, CholmodNesdis, CholmodNesdisParallel, Metis, AMD, Adaptive, Scotch, AccelerateMetis, PardisoMetis, PardisoParallelMetis, Native
     };
 
     // legacy: whether to use Jack Poulson's original implementation for comparison
@@ -118,12 +118,20 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
 
     bool checkPosDef() const override { return m_factorizationType == FactorizationType::Numeric; }
 
+#ifndef MESHFEM_USE_LEGACY_CATAMARI
+    // Owning snapshot of the final (post-amalgamation) new-to-old permutation
+    // of reduced scalar variables. Available after symbolic analysis; pins are
+    // omitted and uniform variable blocks expand to consecutive scalar entries.
+    VecX_T<SuiteSparse_long> getInversePermutation() const;
+#endif
+
     size_t getFactorNNZ() const override;
     double getFlopEstimate() const override;
 
     CholeskyProvider provider() const override {
         if (m_legacy) return CholeskyProvider::CatamariLegacy;
 
+        if (orderingMethod == OrderingMethod::Native) return CholeskyProvider::CatamariNative;
         if (orderingMethod == OrderingMethod::Catamari)           return CholeskyProvider::Catamari;
         else if (orderingMethod == OrderingMethod::CholmodNesdis) return CholeskyProvider::CatamariNesdis;
         else if (orderingMethod == OrderingMethod::CholmodNesdisParallel)

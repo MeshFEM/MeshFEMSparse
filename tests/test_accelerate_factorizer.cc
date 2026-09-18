@@ -29,6 +29,11 @@ void checkAccelerateSolves(const Matrix &A, const SuiteSparseMatrix &scalarA,
             else              factorizer.factorizeNumericWithShift(A, sigma);
             Eigen::VectorXd b = scalarA.apply(expected) + sigma * expected;
             Eigen::VectorXd x = factorizer.solve(b);
+            if (repeat == 0 && sigma == 0) {
+                Eigen::VectorXd reduced(factorizer.n_reduced());
+                REQUIRE_THROWS_AS(factorizer.solveRawReduced(b.data(), reduced.data(), CholeskySys::A, true), std::invalid_argument);
+                REQUIRE_THROWS_AS(factorizer.solveRawReduced(b.data(), reduced.data(), CholeskySys::L), std::invalid_argument);
+            }
             REQUIRE((x - expected).norm() < tolerance * expected.norm());
         }
         if (repeat == 1) factorizer.clearFactors();

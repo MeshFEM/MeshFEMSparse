@@ -50,6 +50,7 @@ size_t CatamariFactorizer::m_reduced() const { assertFactorization(Factorization
 size_t CatamariFactorizer::n_reduced() const { assertFactorization(FactorizationType::Symbolic); return m_ldl->NumRows(); }
 
 void CatamariFactorizer::factorizeSymbolic(const BlockCSCHessianBase &mat, const std::vector<size_t> &pinnedVars) {
+    m_ndOrdering.reset();
     g_matrixRecorder.recordSymbolic(mat, pinnedVars);
 
     const bool blockFactorizationSupported = m_useBlockAccel && mat.uniformBlockSize() && (mat.maxBlockSize() <= MAX_INSTANTIATED_BLOCK_SIZE);
@@ -64,6 +65,7 @@ void CatamariFactorizer::factorizeSymbolic(const BlockCSCHessianBase &mat, const
 }
 
 void CatamariFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars) {
+    m_ndOrdering.reset();
     m_blockSize = 1;
     m_factorizeSymbolic(mat, pinnedVars);
 }
@@ -90,6 +92,8 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
     m_catamariConverter = std::make_unique<CatamariConverter>(*A_reduced, /* block_size = */ 1, /* legacy = */ true, m_entryForReducedEntry);
     using catamari::Int;
 
+    if (orderingMethod == OrderingMethod::Native)
+        throw std::runtime_error("Native ordering requires modern Catamari");
     if (orderingMethod == OrderingMethod::Catamari)
         m_ldl->Factor(m_catamariConverter->get(), *m_ldlControl);
     else if ((orderingMethod == OrderingMethod::CholmodNesdis) || (orderingMethod == OrderingMethod::CholmodNesdisParallel) || (orderingMethod == OrderingMethod::Metis)
@@ -116,7 +120,8 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
                 auto method = actualOrderingMethod == OrderingMethod::Metis ? CholmodOrdering::Method::Metis :
                     actualOrderingMethod == OrderingMethod::CholmodNesdisParallel ? CholmodOrdering::Method::ParallelNestedDissection :
                     CholmodOrdering::Method::NestedDissection;
-                auto iperm = m_cholmodOrdering.inversePermutation<catamari::Int>(*A_reduced, method);
+                auto iperm = m_cholmodOrdering.inversePermutation<catamari::Int>(*A_reduced, method, nullptr, nullptr, &m_ndOrdering);
+                if (m_ndOrdering) m_ndOrdering->blockSize = m_blockSize;
                 std::copy(iperm.data(), iperm.data() + iperm.size(), ordering.inverse_permutation.Data());
                 quotient::InvertPermutation(ordering.inverse_permutation, &ordering.permutation);
             }
@@ -452,10 +457,11 @@ void CatamariFactorizer::m_populatePermutedReducedRowForRow() const {
 // Stashing support
 void CatamariFactorizer::       stashFactorization()       { throw std::runtime_error("CatamariFactorizer::stashFactorization not supported in legacy mode"); }
 bool CatamariFactorizer::  hasStashedFactorization() const { return bool(m_ldlStash); }
-void CatamariFactorizer:: swapStashedFactorization()       { if (!hasStashedFactorization()) { throw std::runtime_error("No stashed factorization"); } std::swap(m_ldl, m_ldlStash); }
+void CatamariFactorizer:: swapStashedFactorization()       { if (!hasStashedFactorization()) { throw std::runtime_error("No stashed factorization"); } std::swap(m_ldl, m_ldlStash); m_ndOrdering.reset(); }
 void CatamariFactorizer::clearStashedFactorization()       { m_ldlStash.reset(); }
 
-void CatamariFactorizer::clearFactors() { m_factorizationType = FactorizationType::None; }
+void CatamariFactorizer::clearFactors() {
+    m_ndOrdering.reset(); m_factorizationType = FactorizationType::None; }
 
 CatamariFactorizer::~CatamariFactorizer() = default;
 

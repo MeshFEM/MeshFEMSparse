@@ -17,6 +17,17 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
 
 std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvider provider, bool singlePrecision) {
     switch (provider) {
+        case CholeskyProvider::CHOLMODNative:
+#if MESHFEM_WITH_CHOLMOD
+            {
+                if (singlePrecision) throw std::invalid_argument("CHOLMOD does not support singlePrecision");
+                auto c = std::make_unique<CholmodFactorizer>();
+                c->setOrderingMethod(CholmodFactorizer::OrderingMethod::Native);
+                return c;
+            }
+#else
+            throw std::runtime_error("Compiled without CHOLMOD");
+#endif
         case CholeskyProvider::CHOLMOD:
             if (singlePrecision) throw std::invalid_argument("CHOLMOD does not support singlePrecision");
             return std::make_unique<CholmodFactorizer>();
@@ -33,6 +44,7 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
 #else
             throw std::runtime_error("Compiled without Accelerate");
 #endif
+        case CholeskyProvider::CatamariNative:
         case CholeskyProvider::Catamari:
         case CholeskyProvider::CatamariNesdis:
         case CholeskyProvider::CatamariNesdisParallel:
@@ -47,7 +59,9 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
                 bool legacy = provider == CholeskyProvider::CatamariLegacy;
                 auto c = std::make_unique<CatamariFactorizer>(legacy, singlePrecision);
                 // c->setUseLeftLooking(true);
-                if (provider == CholeskyProvider::Catamari)
+                if (provider == CholeskyProvider::CatamariNative)
+                    c->orderingMethod = CatamariFactorizer::OrderingMethod::Native;
+                else if (provider == CholeskyProvider::Catamari)
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::Catamari;
                 else if ((provider == CholeskyProvider::CatamariNesdis) || (provider == CholeskyProvider::CatamariLegacy))
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::CholmodNesdis;

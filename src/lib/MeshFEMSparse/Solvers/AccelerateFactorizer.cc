@@ -52,6 +52,8 @@ void AccelerateFactorizer::m_setUpperTriangleCSC(const SuiteSparseMatrix &A_redu
 }
 
 void AccelerateFactorizer::factorizeSymbolic(const BlockCSCHessianBase &mat, const std::vector<size_t> &pinnedVars) {
+    m_ndOrdering.reset();
+    m_dataOffsetForScalarHessianLoc.resize(0);
     g_matrixRecorder.recordSymbolic(mat, pinnedVars);
 
     const bool blockFactorizationSupported = m_useBlockAccel && mat.uniformBlockSize();
@@ -68,6 +70,8 @@ void AccelerateFactorizer::factorizeSymbolic(const BlockCSCHessianBase &mat, con
 }
 
 void AccelerateFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars) {
+    m_ndOrdering.reset();
+    m_dataOffsetForScalarHessianLoc.resize(0);
     m_blockSize = 1;
     m_symbolicFactorizationImpl(mat, pinnedVars);
 }
@@ -75,6 +79,12 @@ void AccelerateFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const
 void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &mat,
                                                        const std::vector<size_t> &pinnedVars) {
     BENCHMARK_SCOPED_TIMER_SECTION timer("AccelerateFactorizer.m_symbolicFactorizationImpl<" + std::to_string(m_blockSize) + ">");
+    // Pin sets and scalar/block mode can change between symbolic analyses.
+    m_entryForReducedEntry.clear();
+    m_blockEntryForReducedBlockEntry.clear();
+    m_reducedRowForRow.clear();
+    m_permutedReducedRowForRow.clear();
+
 
     const SuiteSparseMatrix *A_reduced;
 
@@ -170,7 +180,8 @@ void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &
         auto fullPattern = A_reduced->toSymmetryModeImpl<SuiteSparse_long>(
             SuiteSparseMatrix::SymmetryMode::NONE, [](size_t ii) { return ii; });
         auto iperm = m_cholmodOrdering.inversePermutation<int>(*A_reduced,
-            CholmodOrdering::Method::ParallelNestedDissection, nullptr, &fullPattern);
+            CholmodOrdering::Method::ParallelNestedDissection, nullptr, &fullPattern, &m_ndOrdering);
+        m_ndOrdering->blockSize = m_blockSize;
         m_customOrder.resize(iperm.size());
         for (int i = 0; i < iperm.size(); ++i)
             m_customOrder[iperm[i]] = i;
@@ -178,7 +189,8 @@ void AccelerateFactorizer::m_symbolicFactorizationImpl(const SuiteSparseMatrix &
         m_opts.order = m_customOrder.data();
     }
     else if (orderingMethod == OrderingMethod::Nesdis) {
-        auto iperm = m_cholmodOrdering.inversePermutation<SuiteSparse_long>(*A_reduced, CholmodOrdering::Method::NestedDissection);
+        auto iperm = m_cholmodOrdering.inversePermutation<SuiteSparse_long>(*A_reduced, CholmodOrdering::Method::NestedDissection, nullptr, nullptr, &m_ndOrdering);
+        m_ndOrdering->blockSize = m_blockSize;
         m_customOrder.resize(iperm.size());
         for (int i = 0; i < iperm.size(); ++i)
             m_customOrder[iperm[i]] = i;
@@ -317,7 +329,11 @@ void AccelerateFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &A,
 void AccelerateFactorizer::solveRawReduced(const Real *b,
                                            Real *x,
                                            CholeskySys sys,
-                                           bool) const {
+                                           bool alreadyPermuted) const {
+    if (alreadyPermuted)
+        throw std::invalid_argument("AccelerateFactorizer does not support alreadyPermuted solves");
+    if (sys != CholeskySys::A)
+        throw std::invalid_argument("AccelerateFactorizer only supports CholeskySys::A");
     assertFactorization(sys);
 
     if (m_singlePrecision) {

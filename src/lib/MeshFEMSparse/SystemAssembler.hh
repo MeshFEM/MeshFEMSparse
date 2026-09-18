@@ -22,6 +22,7 @@
 #include <MeshFEMSparse/Utilities/argsort.hh>
 
 #include <MeshFEMSparse/VarStructure.hh>
+#include <MeshFEMSparse/ElementPartitionFromND.hh>
 #include <MeshFEMSparse/BlockCSCHessian.hh>
 #include <MeshFEMSparse/BorderedSparseHessian.hh>
 
@@ -729,6 +730,55 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
     template<class Result, class Mesh, class PEGEval>
     void assembleGradient(Result &g, const Mesh &m, const PEGEval &eval_ge) const {
         return assembleGradient(g, m.numElements(), eval_ge, [&m](size_t ei) { return m.elementNodeIndices(ei); });
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // Partition-based assembly: use an element partition derived from nested
+    // dissection. By assigning each partition to a task, the assembly can be
+    // parallelized while narrowing the potential for write conflicts down to a
+    // small set of separator variables. We use spin locks for only those block
+    // variables, and all other writes can be unprotected.
+    //
+    // For best performance, the element set should be sorted so that
+    // `partition.elementIndex(*)` returns contiguous indices, and vertices
+    // should also be reordered with the ND ordering.
+    //
+    // The partition must have been constructed/validated for the current
+    // element set accessed by `element` (i.e., any node `ni` shared by two
+    // elements in different partitions must have `needsLock[ni] = true`).
+    // That validation is skipped here for performance reasons.
+    template<class Result, class Index, class PEGEval, class ElementGetter>
+    void assembleGradient(Result &g, const ElementPartitionFromND<Index> &partition,
+                          const PEGEval &eval_ge, const ElementGetter &element) const {
+        if (partition.numBlockVars() > numBlockVars())
+            throw std::invalid_argument("Gradient partition exceeds assembler variable count");
+        if (size_t(g.size()) < m_vars.numSparseVars())
+            throw std::invalid_argument("Gradient assembly destination is too small");
+        const bool parallel = get_max_num_tbb_threads() != 1 && partition.numPartitions() > 1;
+        if (parallel) m_varLocks.init(numBlockVars());
+        parallel_for_range(partition.numPartitions(), [&](size_t p) {
+            for (Index j = partition.partitionOffsets[p]; j < partition.partitionOffsets[p + 1]; ++j) {
+                const auto ei = partition.elementIndex(j);
+                const auto blockVars = element(ei);
+                const auto ge = eval_ge(ei);
+                size_t lvar = 0;
+                for (decltype(blockVars.size()) lbi = 0; lbi < blockVars.size(); ++lbi) {
+                    const auto bi = blockVars[lbi];
+                    const bool needsLock = parallel && partition.variableNeedsLock[bi];
+                    if (needsLock) m_varLocks.lock(bi);
+                    if constexpr (SingleBlockDim) {
+                        constexpr size_t N = VarStructure::FirstBlockDim;
+                        g.template segment<N>(N * bi) += ge.template segment<N>(N * lbi);
+                    }
+                    else {
+                        auto [gvar, bs] = m_vars.blockInfo(bi);
+                        g.segment(gvar, bs) += ge.segment(lvar, bs);
+                        lvar += bs;
+                    }
+                    if (needsLock) m_varLocks.unlock(bi);
+                }
+            }
+        });
     }
 
     ////////////////////////////////////////////////////////////////////////////

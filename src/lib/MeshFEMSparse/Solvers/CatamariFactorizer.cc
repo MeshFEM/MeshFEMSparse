@@ -41,6 +41,7 @@ template<class Field>
 struct CatamariFactorizer::State {
     std::unique_ptr<catamari::SparseLDL<Field>> ldl = std::make_unique<catamari::SparseLDL<Field>>();
     std::unique_ptr<catamari::SparseLDL<Field>> stash;
+    bool nativeOrdering = false, stashNativeOrdering = false;
     FactorizationType stashType = FactorizationType::None;
     std::unique_ptr<catamari::SparseLDLControl<Field>> control = std::make_unique<catamari::SparseLDLControl<Field>>();
     std::unique_ptr<CatamariConverterT<Field>> converter;
@@ -49,6 +50,7 @@ struct CatamariFactorizer::State {
 
     // The public interface uses doubles even when the factor is single precision.
     void solve(catamari::BlasMatrixView<double> *v, catamari::Int blockSize, bool alreadyPermuted) {
+        alreadyPermuted |= nativeOrdering;
         if constexpr (std::is_same_v<Field, double>) ldl->Solve(v, blockSize, alreadyPermuted);
         else {
             using Stride = Eigen::OuterStride<>;
@@ -107,6 +109,7 @@ CatamariFactorizer::CatamariFactorizer(bool legacy, bool singlePrecision) : m_le
 }
 
 void CatamariFactorizer::clearFactors() {
+    m_ndOrdering.reset();
     m_factorizationType = FactorizationType::None;
 }
 
@@ -131,6 +134,7 @@ size_t CatamariFactorizer::n_reduced() const {
 }
 
 void CatamariFactorizer::factorizeSymbolic(const BlockCSCHessianBase &mat, const std::vector<size_t> &pinnedVars) {
+    m_ndOrdering.reset();
     g_matrixRecorder.recordSymbolic(mat, pinnedVars);
     // We only support uniform block sizes, and only up to
     // `MAX_INSTANTIATED_BLOCK_SIZE`; all others get converted to an ordinary scalar matrix.
@@ -157,6 +161,7 @@ void CatamariFactorizer::factorizeSymbolic(const BlockCSCHessianBase &mat, const
 }
 
 void CatamariFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars) {
+    m_ndOrdering.reset();
     m_dataOffsetForScalarHessianLoc.resize(0);
     m_blockSize = 1;
     m_factorizeSymbolic(mat, pinnedVars);
@@ -267,7 +272,20 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
 
     using catamari::Int;
 
-    if (orderingMethod == OrderingMethod::Catamari)
+    state.nativeOrdering = orderingMethod == OrderingMethod::Native;
+    if (state.nativeOrdering) {
+        catamari::SymmetricOrdering ordering;
+        ordering.permutation.Resize(A_reduced->m);
+        ordering.inverse_permutation.Resize(A_reduced->m);
+        for (Int i = 0; i < A_reduced->m; ++i)
+            ordering.permutation[i] = ordering.inverse_permutation[i] = i;
+        // Constrain supernode relaxation not to alter ordering so native solves
+        // can continue to bypass permutations.
+        auto control = *state.control;
+        control.supernodal_control.relaxation_control.preserve_ordering = true;
+        state.ldl->Factor(state.converter->get(), ordering, control, /* symbolic_only = */ true);
+    }
+    else if (orderingMethod == OrderingMethod::Catamari)
         state.ldl->Factor(state.converter->get(), *state.control, /* symbolic_only = */ true);
     else if ((orderingMethod == OrderingMethod::CholmodNesdis) || (orderingMethod == OrderingMethod::CholmodNesdisParallel)
           || (orderingMethod == OrderingMethod::Metis)
@@ -294,7 +312,8 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
                 auto method = actualOrderingMethod == OrderingMethod::CholmodNesdis
                     ? CholmodOrdering::Method::NestedDissection : CholmodOrdering::Method::ParallelNestedDissection;
                 auto iperm = m_cholmodOrdering.inversePermutation<catamari::Int>(*A_reduced, method, &forest,
-                    actualOrderingMethod == OrderingMethod::CholmodNesdisParallel ? &fullPattern : nullptr);
+                    actualOrderingMethod == OrderingMethod::CholmodNesdisParallel ? &fullPattern : nullptr, &m_ndOrdering);
+                m_ndOrdering->blockSize = m_blockSize;
                 Eigen::Map<VecX_T<catamari::Int>>(ordering.inverse_permutation.Data(), A_reduced->m) = iperm;
                 quotient::InvertPermutation(ordering.inverse_permutation, &ordering.permutation);
                 ordering.supernode_sizes.Resize(forest.sizes.size());
@@ -694,6 +713,14 @@ void CatamariFactorizer::m_numericFactorizationImpl(State<Field> &state, const S
     // std::cout << "num_fact_duration: " << num_fact_duration << std::endl;
 }
 
+VecX_T<SuiteSparse_long> CatamariFactorizer::getInversePermutation() const {
+    assertFactorization(FactorizationType::Symbolic);
+    const auto &p = m_ordering().inverse_permutation;
+    VecX_T<SuiteSparse_long> result(p.Size());
+    for (size_t i = 0; i < p.Size(); ++i) result[i] = p[i];
+    return result;
+}
+
 size_t CatamariFactorizer::getFactorNNZ() const {
     assertFactorization(FactorizationType::Symbolic);
     return m_withState([](auto &state) { return state.ldl->supernodal_factorization->GetFactorNNZ(); });
@@ -763,6 +790,7 @@ void CatamariFactorizer::solveRawReduced(const Real *b, Real *x, CholeskySys sys
     if (sys != CholeskySys::A) throw std::runtime_error("Alternative CholeskySys not yet wrapped for Catamari");
     BENCHMARK_SCOPED_TIMER_SECTION timer("CatamariFactorizer.solveRawReduced");
     const size_t s = m_reduced();
+    alreadyPermuted |= m_withState([](auto &state) { return state.nativeOrdering; });
     if (alreadyPermuted) {
         BENCHMARK_SCOPED_TIMER_SECTION timer2("copy " + std::to_string(s) + " entries");
         // Eigen::Map<Eigen::VectorXd>(x, s) = Eigen::Map<const Eigen::VectorXd>(b, s);
@@ -899,6 +927,7 @@ void CatamariFactorizer::stashFactorization() {
         assertFactorization(FactorizationType::Symbolic);
         state.stash = state.ldl->Clone();
         state.stashType = m_factorizationType;
+        state.stashNativeOrdering = state.nativeOrdering;
     });
 }
 bool CatamariFactorizer::hasStashedFactorization() const {
@@ -908,6 +937,8 @@ void CatamariFactorizer::swapStashedFactorization() {
     return m_withState([&](auto &state) {
         if (!state.stash) throw std::runtime_error("No stashed factorization");
         std::swap(state.ldl, state.stash);
+        m_ndOrdering.reset(); // The restored factorization may use a different ordering.
+        std::swap(state.nativeOrdering, state.stashNativeOrdering);
         std::swap(m_factorizationType, state.stashType);
         m_permutedReducedRowForRow.clear();
     });

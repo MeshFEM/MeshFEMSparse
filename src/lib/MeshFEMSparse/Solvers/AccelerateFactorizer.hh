@@ -77,6 +77,7 @@ struct MESHFEM_EXPORT AccelerateFactorizer final : public CholeskyFactorizerBase
     void clearStashedFactorization()       override { throw std::runtime_error("Stashing unimplemented"); }
 
     void clearFactors() override {
+        m_ndOrdering.reset();
 #ifdef __APPLE__
         m_numfactor.reset();
         m_numfactor_float.reset();
@@ -94,6 +95,7 @@ struct MESHFEM_EXPORT AccelerateFactorizer final : public CholeskyFactorizerBase
     OrderingMethod orderingMethod = OrderingMethod::Metis;
 
     bool storeOrdering = false;
+    // Requested ordering; may differ from the internal factor permutation.
     const VecX_T<int> getPermutation() const {
         ensureApple();
 #if __APPLE__

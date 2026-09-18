@@ -190,14 +190,19 @@ struct CholmodFactorizer final : public CholeskyFactorizerBase {
     using CholeskyFactorizerBase::factorizeNumeric;
     using CholeskyFactorizerBase::factorizeNumericWithShift;
 
-    enum class OrderingMethod { Nesdis, Metis, AMD };
+    enum class OrderingMethod { Nesdis, Metis, AMD, Native };
 
     void setOrderingMethod(OrderingMethod method) {
         if (method == OrderingMethod::Nesdis)     m_c->method[0].ordering = CHOLMOD_NESDIS;
         else if (method == OrderingMethod::Metis) m_c->method[0].ordering = CHOLMOD_METIS;
         else if (method == OrderingMethod::AMD)   m_c->method[0].ordering = CHOLMOD_AMD;
+        else if (method == OrderingMethod::Native) m_c->method[0].ordering = CHOLMOD_NATURAL;
         else throw std::runtime_error("Unknown ordering method");
+        m_c->postorder = method != OrderingMethod::Native;
+        m_orderingMethod = method;
     }
+
+    OrderingMethod getOrderingMethod() const { return m_orderingMethod; }
 
     // Perform only the symbolic factorization for the given matrix `mat`.
     void factorizeSymbolic(const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars) override {
@@ -305,7 +310,6 @@ struct CholmodFactorizer final : public CholeskyFactorizerBase {
     void solveRawReduced(const Real *b, Real *x, CholeskySys sys = CholeskySys::A, bool alreadyPermuted = false) const override {
         assertFactorization(sys);
         static_assert(std::is_same<Real, double>::value, "Right-hand side must be an array of doubles");
-        if (alreadyPermuted) throw std::runtime_error("Unimplemented");
 
         const size_t m = m_L->n, n = m_L->n;
 
@@ -318,7 +322,7 @@ struct CholmodFactorizer final : public CholeskyFactorizerBase {
         int chol_sys;
 
         switch (sys) {
-            case CholeskySys::A:  chol_sys = CHOLMOD_A;  break;
+            case CholeskySys::A:  chol_sys = (alreadyPermuted || m_nativeOrdering) ? CHOLMOD_LDLt : CHOLMOD_A;  break;
             case CholeskySys::L:  chol_sys = CHOLMOD_L;  break;
             case CholeskySys::Lt: chol_sys = CHOLMOD_Lt; break;
             case CholeskySys::P:  chol_sys = CHOLMOD_P;  break;
@@ -343,12 +347,13 @@ struct CholmodFactorizer final : public CholeskyFactorizerBase {
     void stashFactorization() override {
         if (m_L_stashed != nullptr) CHOLMOD_CALL(free_factor)(&m_L_stashed, m_c.get());
         m_L_stashed = CHOLMOD_CALL(copy_factor)(m_L, m_c.get());
+        m_stashNativeOrdering = m_nativeOrdering;
     }
 
     bool hasStashedFactorization() const override { return m_L_stashed != nullptr; }
 
     // Exchange the roles of m_L and m_L_stashed, making the stash the active factorization.
-    void swapStashedFactorization() override { std::swap(m_L, m_L_stashed); }
+    void swapStashedFactorization() override { std::swap(m_L, m_L_stashed); std::swap(m_nativeOrdering, m_stashNativeOrdering); }
 
     void clearStashedFactorization() override {
         if (m_L_stashed) { CHOLMOD_CALL(free_factor)(&m_L_stashed, m_c.get()); m_L_stashed = nullptr; }
@@ -422,7 +427,7 @@ struct CholmodFactorizer final : public CholeskyFactorizerBase {
         m_c->print = suppressWarnings ? 0 : 2;
     }
 
-    virtual CholeskyProvider provider() const override { return CholeskyProvider::CHOLMOD; }
+    virtual CholeskyProvider provider() const override { return m_orderingMethod == OrderingMethod::Native ? CholeskyProvider::CHOLMODNative : CholeskyProvider::CHOLMOD; }
 
     virtual ~CholmodFactorizer() {
         clearFactors();
@@ -434,6 +439,8 @@ struct CholmodFactorizer final : public CholeskyFactorizerBase {
     }
 
 private:
+    OrderingMethod m_orderingMethod = OrderingMethod::Nesdis;
+    bool m_nativeOrdering = false, m_stashNativeOrdering = false;
     std::unique_ptr<SuiteSparseMatrix> m_Ashift;
     std::shared_ptr<cholmod_common> m_c;
     cholmod_factor *m_L = nullptr, *m_L_stashed = nullptr;
@@ -449,6 +456,8 @@ private:
         BENCHMARK_START_TIMER("CHOLMOD Symbolic Factorize");
         clearFactors();
         m_L = CHOLMOD_CALL(analyze)(const_cast<cholmod_sparse *>(&A), m_c.get());
+        if (!m_L) throw std::runtime_error("CHOLMOD symbolic factorization failed");
+        m_nativeOrdering = m_orderingMethod == OrderingMethod::Native;
         m_factorizationType = FactorizationType::Symbolic;
         BENCHMARK_STOP_TIMER("CHOLMOD Symbolic Factorize");
     }

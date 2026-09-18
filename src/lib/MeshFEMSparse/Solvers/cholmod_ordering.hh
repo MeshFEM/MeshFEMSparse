@@ -71,23 +71,26 @@ public:
     template<class Index>
     VecX_T<Index> inversePermutation(const SuiteSparseMatrix &A, Method method,
                                     PreliminaryAssemblyForest<Index> *forest = nullptr,
-                                    const CSCMatrix<SuiteSparse_long, SuiteSparse_long> *fullPattern = nullptr) {
+                                    const CSCMatrix<SuiteSparse_long, SuiteSparse_long> *fullPattern = nullptr,
+                                    std::optional<CholeskyFactorizerBase::NDOrdering> *nd = nullptr) {
         static_assert(std::is_same_v<Index, SuiteSparse_long> || std::is_same_v<Index, int>,
                       "CholmodOrdering supports only SuiteSparse_long and int indices.");
         if (forest) *forest = {};
+        if (nd) nd->reset();
         if (method != Method::ParallelNestedDissection) resetTemporalReuse();
 #if MESHFEM_WITH_CHOLMOD
         if (fullPattern && method == Method::ParallelNestedDissection) {
             if (fullPattern->m != A.m || fullPattern->n != A.n)
                 throw std::invalid_argument("Full ordering pattern dimensions do not match the matrix.");
-            return inversePermutationFullPattern<Index>(*fullPattern, forest);
+            return inversePermutationFullPattern<Index>(*fullPattern, forest, nd);
         }
-        if constexpr (std::is_same_v<Index, SuiteSparse_long>) return inversePermutationLong(A, method, forest);
-        else                                                   return inversePermutationInt (A, method, forest);
+        if constexpr (std::is_same_v<Index, SuiteSparse_long>) return inversePermutationLong(A, method, forest, nd);
+        else                                                   return inversePermutationInt (A, method, forest, nd);
 #else
         (void) A;
         (void) method;
         (void) fullPattern;
+        (void) nd;
         throw std::runtime_error("CHOLMOD ordering requested, but CHOLMOD support is not available in this build.");
 #endif
     }
@@ -161,10 +164,12 @@ private:
     template<class Index>
     VecX_T<Index> inversePermutationFullPattern(
         const CSCMatrix<SuiteSparse_long, SuiteSparse_long> &A,
-        PreliminaryAssemblyForest<Index> *forest) {
+        PreliminaryAssemblyForest<Index> *forest,
+        std::optional<CholeskyFactorizerBase::NDOrdering> *nd) {
 #ifdef NPARTITION
         (void) A;
         (void) forest;
+        (void) nd;
         throwPartitionUnavailable();
 #else
         BENCHMARK_SCOPED_TIMER_SECTION timer("parallel nesdis from full graph");
@@ -197,8 +202,20 @@ private:
             graph, perm.data(), parent.data(), member.data(), common, &reuseState<Index>());
         if (nc < 0) throw std::runtime_error("Parallel CHOLMOD nested dissection from full graph failed.");
         if (forest) *forest = extractAssemblyForest(perm, parent, member, nc);
+        retainNDOrdering(nd, parent, member, nc);
         return perm;
 #endif
+    }
+
+    template<class Index>
+    static void retainNDOrdering(std::optional<CholeskyFactorizerBase::NDOrdering> *nd,
+                                 const VecX_T<Index> &parent, const VecX_T<Index> &member, int64_t nc) {
+        if (!nd) return;
+        if (nc < 0 || nc > parent.size()) throw std::runtime_error("Invalid ND component count");
+        CholeskyFactorizerBase::NDOrdering result;
+        result.CParent.assign(parent.data(), parent.data() + nc);
+        result.CMember.assign(member.data(), member.data() + member.size());
+        *nd = std::move(result);
     }
 
     template<class Index>
@@ -241,7 +258,8 @@ private:
     }
 
     VecX_T<SuiteSparse_long> inversePermutationLong(const SuiteSparseMatrix &A, Method method,
-                                                   PreliminaryAssemblyForest<SuiteSparse_long> *forest) {
+                                                   PreliminaryAssemblyForest<SuiteSparse_long> *forest,
+                                                   std::optional<CholeskyFactorizerBase::NDOrdering> *nd) {
         auto cholmat = sparseView(A.m, A.n, A.nz,
                                   const_cast<SuiteSparse_long *>(A.Ai.data()),
                                   const_cast<SuiteSparse_long *>(A.Ap.data()));
@@ -263,6 +281,7 @@ private:
                                             iperm.data(), CParent.data(), CMember.data(), commonLong());
                 if (nc < 0) throw std::runtime_error("CHOLMOD nested dissection failed.");
                 if (forest) *forest = extractAssemblyForest(iperm, CParent, CMember, nc);
+                retainNDOrdering(nd, CParent, CMember, nc);
 #endif
                 break;
             }
@@ -277,6 +296,7 @@ private:
                 if (nc < 0)
                     throw std::runtime_error("Parallel CHOLMOD nested dissection failed.");
                 if (forest) *forest = extractAssemblyForest(iperm, CParent, CMember, nc);
+                retainNDOrdering(nd, CParent, CMember, nc);
 #endif
                 break;
             }
@@ -298,7 +318,8 @@ private:
     }
 
     VecX_T<int> inversePermutationInt(const SuiteSparseMatrix &A, Method method,
-                                     PreliminaryAssemblyForest<int> *forest) {
+                                     PreliminaryAssemblyForest<int> *forest,
+                                     std::optional<CholeskyFactorizerBase::NDOrdering> *nd) {
         VecX_T<int> Ai_downcast = Eigen::Map<const VecX_T<SuiteSparse_long>>(A.Ai.data(), A.Ai.size()).template cast<int>();
         VecX_T<int> Ap_downcast = Eigen::Map<const VecX_T<SuiteSparse_long>>(A.Ap.data(), A.Ap.size()).template cast<int>();
         auto cholmat = sparseView(A.m, A.n, A.nz, Ai_downcast.data(), Ap_downcast.data());
@@ -320,6 +341,7 @@ private:
                                           iperm.data(), CParent.data(), CMember.data(), commonInt());
                 if (nc < 0) throw std::runtime_error("CHOLMOD nested dissection failed.");
                 if (forest) *forest = extractAssemblyForest(iperm, CParent, CMember, nc);
+                retainNDOrdering(nd, CParent, CMember, nc);
 #endif
                 break;
             }
@@ -334,6 +356,7 @@ private:
                 if (nc < 0)
                     throw std::runtime_error("Parallel CHOLMOD nested dissection failed.");
                 if (forest) *forest = extractAssemblyForest(iperm, CParent, CMember, nc);
+                retainNDOrdering(nd, CParent, CMember, nc);
 #endif
                 break;
             }
