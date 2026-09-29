@@ -12,7 +12,7 @@ auto gridElements() {
     std::vector<std::array<size_t, 3>> e;
     for (size_t y=0; y+1<side; ++y) for (size_t x=0; x+1<side; ++x) {
         size_t a=y*side+x;
-        e.push_back({a,a+1,a+side}); e.push_back({a+1,a+side+1,a+side});
+        e.push_back({{a,a+1,a+side}}); e.push_back({{a+1,a+side+1,a+side}});
     }
     return e;
 }

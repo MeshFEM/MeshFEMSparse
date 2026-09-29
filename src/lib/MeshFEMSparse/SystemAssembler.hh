@@ -667,7 +667,7 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
     ////////////////////////////////////////////////////////////////////////////
     template<class PEH>
     static auto getBlock(const PEH &H_e, size_t a, size_t b, size_t bsa [[maybe_unused]] = VarStructure::MaxBlockDim, size_t bsb [[maybe_unused]] = VarStructure::MaxBlockDim) {
-        static constexpr size_t N = VarStructure::MaxBlockDim;
+        [[maybe_unused]] static constexpr size_t N = VarStructure::MaxBlockDim;
         if constexpr (VarStructure::SingleBlockDim) {
             return H_e.template block<N, N>(a, b);
         }
@@ -761,7 +761,7 @@ struct MESHFEM_EXPORT SystemAssembler : public SystemAssemblerBase {
                 const auto ei = partition.elementIndex(j);
                 const auto blockVars = element(ei);
                 const auto ge = eval_ge(ei);
-                size_t lvar = 0;
+                [[maybe_unused]] size_t lvar = 0;
                 for (decltype(blockVars.size()) lbi = 0; lbi < blockVars.size(); ++lbi) {
                     const auto bi = blockVars[lbi];
                     const bool needsLock = parallel && partition.variableNeedsLock[bi];

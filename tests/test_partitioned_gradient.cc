@@ -52,7 +52,7 @@ void checkAssembly(SystemAssembler<Dims...> &assembler) {
 
     // Initialize and exercise the shared lock pool through Hessian assembly
     // first, then reuse it for repeated partitioned gradient calls.
-    auto edge = [](size_t e) { return std::array<size_t, 2>{0, e + 1}; };
+    auto edge = [](size_t e) { return std::array<size_t, 2>{{0, e + 1}}; };
     auto H = assembler.blockSparsityPattern(64, edge);
     H->Ax.assign(H->scalarNNZ(), 0);
     auto hessian = [&](size_t e) -> Eigen::MatrixXd {
@@ -114,7 +114,7 @@ TEST_CASE("Partitioned gradient assembly reuses variable locks", "[partitioned_g
 }
 
 TEST_CASE("ND partition index types", "[nd_partition]") {
-    std::vector<std::array<int64_t, 3>> elements{{0,1,2}, {1,0,3}};
+    std::vector<std::array<int64_t, 3>> elements{{{0,1,2}}, {{1,0,3}}};
     auto element = [&](size_t e) { return elements[e]; };
     std::vector<int64_t> parent{2,2,-1}, member{2,2,0,1};
     ElementPartitionFromND partition(elements.size(), element, parent, member, 1);

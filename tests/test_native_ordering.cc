@@ -16,7 +16,7 @@ TEST_CASE("Native ordering preserves reduced input order", "[native_ordering]") 
     // A center-first star is deliberately not in elimination-tree postorder.
     // Dense or path matrices alone can hide an unwanted postordering.
     SystemAssembler<2> assembler(12);
-    auto A = assembler.blockSparsityPattern(11, [](size_t e) { return std::array<size_t, 2>{0, e + 1}; });
+    auto A = assembler.blockSparsityPattern(11, [](size_t e) { return std::array<size_t, 2>{{0, e + 1}}; });
     A->setZero();
     auto scalar = A->toScalar();
     for (auto e : scalar) A->addNZScalar(e.i, e.j, e.i == e.j ? 30.0 : -0.1 * (1 + (e.i + e.j) % 7));
@@ -123,7 +123,7 @@ TEST_CASE("Native ordering changes take effect at symbolic analysis", "[native_o
 TEST_CASE("Catamari native ordering amalgamates without permuting", "[catamari][native_ordering]") {
     // Interleaved branches: unrestricted relaxation merges all five blocks
     // and reorders them. Native relaxation can retain [0] and merge [1,2,3,4].
-    const std::array<std::array<size_t, 2>, 4> edges{{{0,3}, {1,2}, {2,4}, {3,4}}};
+    const std::array<std::array<size_t, 2>, 4> edges{{{{0,3}}, {{1,2}}, {{2,4}}, {{3,4}}}};
     SystemAssembler<2> assembler(5);
     auto A = assembler.blockSparsityPattern(edges.size(), [&](size_t e) { return edges[e]; });
     A->setZero();
@@ -154,7 +154,7 @@ TEST_CASE("Catamari native ordering amalgamates without permuting", "[catamari][
 
 #if MESHFEM_WITH_CATAMARI && MESHFEM_WITH_CHOLMOD && !defined(MESHFEM_USE_LEGACY_CATAMARI)
 TEST_CASE("Catamari final permutation indexes reduced scalar variables", "[catamari][nd_ordering]") {
-    const std::array<std::array<size_t, 2>, 4> edges{{{0,3}, {1,2}, {2,4}, {3,4}}};
+    const std::array<std::array<size_t, 2>, 4> edges{{{{0,3}}, {{1,2}}, {{2,4}}, {{3,4}}}};
     SystemAssembler<2> assembler(5);
     auto A = assembler.blockSparsityPattern(edges.size(), [&](size_t e) { return edges[e]; });
     for (bool single : {false, true}) for (bool blocks : {false, true})
