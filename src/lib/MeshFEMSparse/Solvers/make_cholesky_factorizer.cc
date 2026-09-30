@@ -8,6 +8,9 @@
 #if __APPLE__
 #include "AccelerateFactorizer.hh"
 #endif
+#if MESHFEM_WITH_CUDSS
+#include "CuDSSFactorizer.hh"
+#endif
 
 namespace MeshFEM {
 
@@ -37,6 +40,13 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
             return std::make_unique<PardisoFactorizer>();
 #else
             throw std::runtime_error("Compiled without Pardiso");
+#endif
+        case CholeskyProvider::CUDSS:
+            if (singlePrecision) throw std::invalid_argument("cuDSS factorizer does not support singlePrecision");
+#if MESHFEM_WITH_CUDSS
+            return std::make_unique<CuDSSFactorizer>();
+#else
+            throw std::runtime_error("Compiled without cuDSS");
 #endif
         case CholeskyProvider::Accelerate:
 #if __APPLE__

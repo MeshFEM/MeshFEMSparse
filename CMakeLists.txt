@@ -16,6 +16,7 @@ option(MESHFEM_USE_LEGACY_CATAMARI   "Use Jack Poulson's original Catamari code 
 option(MESHFEM_WITH_SCOTCH           "Compile MeshFEM with support for Scotch reordering, if possible" OFF)
 option(MESHFEM_WITH_MKL_PARDISO      "Compile MeshFEM with MKL Pardiso"   OFF)
 option(MESHFEM_WITH_PARDISO          "Compile MeshFEM with Pardiso"   OFF)
+option(MESHFEM_WITH_CUDSS            "Compile MeshFEM with NVIDIA cuDSS (GPU sparse direct solver)"   OFF)
 option(MESHFEM_NO_GPL                "Compile MeshFEM without GPL-licensed dependencies (UMFPACK, supernodal CHOLMOD, etc.)" OFF)
 option(MESHFEM_WITH_CHOLMOD          "Compile MeshFEM with CHOLMOD for LL^T factorization" ON)
 option(MESHFEM_WITH_UMFPACK          "Compile MeshFEM with UMFPACK for LU factorization (GPL licensed)" OFF)
@@ -67,6 +68,7 @@ add_library(MeshFEMSparse STATIC
     src/lib/MeshFEMSparse/Solvers/pardiso_ordering.cc
     src/lib/MeshFEMSparse/Solvers/AccelerateFactorizer.cc
     src/lib/MeshFEMSparse/Solvers/accelerate_ordering.cc
+    src/lib/MeshFEMSparse/Solvers/CuDSSFactorizer.cc
 )
 
 if (MESHFEM_USE_LEGACY_CATAMARI)
@@ -141,6 +143,14 @@ if (MESHFEM_WITH_PARDISO)
         /home/jpanetta/software/pardiso/libpardiso600-GNU800-X86-64.so
          -L${MKLROOT}/lib/intel64 -lmkl_rt -Wl,--no-as-needed -lpthread -lm -ldl -lgomp
         -lgfortran)
+endif()
+
+if (MESHFEM_WITH_CUDSS)
+    # Point CMake at the install with, e.g., -Dcudss_DIR=<cudss>/lib/cmake/cudss
+    find_package(CUDAToolkit REQUIRED)
+    find_package(cudss REQUIRED)
+    target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_CUDSS)
+    target_link_libraries(MeshFEMSparse PUBLIC cudss CUDA::cudart)
 endif()
 
 if (MESHFEMSPARSE_BUILD_TESTS)
