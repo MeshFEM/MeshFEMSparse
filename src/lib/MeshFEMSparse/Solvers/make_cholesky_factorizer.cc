@@ -42,9 +42,8 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
             throw std::runtime_error("Compiled without Pardiso");
 #endif
         case CholeskyProvider::CUDSS:
-            if (singlePrecision) throw std::invalid_argument("cuDSS factorizer does not support singlePrecision");
 #if MESHFEM_WITH_CUDSS
-            return std::make_unique<CuDSSFactorizer>();
+            return std::make_unique<CuDSSFactorizer>(singlePrecision);
 #else
             throw std::runtime_error("Compiled without cuDSS");
 #endif

@@ -1,5 +1,6 @@
 #if MESHFEM_WITH_CUDSS
 #include <MeshFEMSparse/Solvers/CuDSSFactorizer.hh>
+#include <MeshFEMSparse/Solvers/make_cholesky_factorizer.hh>
 #include <MeshFEMSparse/SystemAssembler.hh>
 
 // Include Catch after MeshFEM to avoid its BENCHMARK macro conflict.
@@ -37,19 +38,26 @@ SuiteSparseMatrix diagonallyDominant6x6() {
     return A;
 }
 
+// Float has ~7 significant digits, and errors grow with the condition number
+// (~180 for the 20x20 Laplacian), so single precision gets a looser tolerance.
+double solveTolerance(const CuDSSFactorizer &factorizer) {
+    return factorizer.isSinglePrecision() ? 1e-4 : 1e-12;
+}
+
 // Solve `(A + sigma I) x = b` for a known `x` and compare.
 template<class Matrix>
 void checkCuDSSSolves(CuDSSFactorizer &factorizer, const Matrix &A, const SuiteSparseMatrix &scalarA,
                       const std::vector<size_t> &pins) {
     Eigen::VectorXd expected = Eigen::VectorXd::LinSpaced(scalarA.n, -0.5, 1.0);
     for (size_t i : pins) expected[i] = 0.0;
-    const double tolerance = 1e-12;
+    const double tolerance = solveTolerance(factorizer);
+    const bool singlePrecision = factorizer.isSinglePrecision();
 
     // Exercise symbolic replacement, numeric reuse, and reuse after clearing.
     for (int repeat = 0; repeat < 3; ++repeat) {
         factorizer.factorizeSymbolic(A, pins);
         for (double sigma : {0.0, 0.75, 0.25, 0.0}) {
-            CAPTURE(pins, repeat, sigma);
+            CAPTURE(singlePrecision, pins, repeat, sigma);
             if (sigma == 0.0) factorizer.factorizeNumeric(A);
             else              factorizer.factorizeNumericWithShift(A, sigma);
             REQUIRE(factorizer.checkPosDef());
@@ -63,9 +71,10 @@ void checkCuDSSSolves(CuDSSFactorizer &factorizer, const Matrix &A, const SuiteS
 }
 
 TEST_CASE("cuDSS solves scalar and block matrices", "[cudss]") {
+    const bool singlePrecision = GENERATE(false, true);
     const auto pins = GENERATE(std::vector<size_t>{}, std::vector<size_t>{0, 1}, std::vector<size_t>{1});
     SuiteSparseMatrix scalarA = diagonallyDominant6x6();
-    CuDSSFactorizer factorizer;
+    CuDSSFactorizer factorizer(singlePrecision);
 
     SECTION("scalar matrix") {
         checkCuDSSSolves(factorizer, scalarA, scalarA, pins);
@@ -83,8 +92,9 @@ TEST_CASE("cuDSS solves scalar and block matrices", "[cudss]") {
 }
 
 TEST_CASE("cuDSS handles a larger system and a change of sparsity pattern", "[cudss]") {
+    const bool singlePrecision = GENERATE(false, true);
     const auto pins = GENERATE(std::vector<size_t>{}, std::vector<size_t>{0, 7, 100, 399});
-    CuDSSFactorizer factorizer;
+    CuDSSFactorizer factorizer(singlePrecision);
 
     // The same factorizer (and its cuDSS data object) is reused for a second,
     // differently sized pattern.
@@ -98,8 +108,10 @@ TEST_CASE("cuDSS handles a larger system and a change of sparsity pattern", "[cu
 }
 
 TEST_CASE("cuDSS rejects indefinite matrices and unsupported solves", "[cudss]") {
+    const bool singlePrecision = GENERATE(false, true);
+    CAPTURE(singlePrecision);
     SuiteSparseMatrix A = diagonallyDominant6x6();
-    CuDSSFactorizer factorizer;
+    CuDSSFactorizer factorizer(singlePrecision);
     factorizer.factorizeSymbolic(A);
 
     SECTION("indefinite matrix throws, and the factorizer recovers") {
@@ -114,7 +126,7 @@ TEST_CASE("cuDSS rejects indefinite matrices and unsupported solves", "[cudss]")
         REQUIRE(factorizer.checkPosDef());
         Eigen::VectorXd expected = Eigen::VectorXd::LinSpaced(6, -0.5, 1.0);
         Eigen::VectorXd x = factorizer.solve(A.apply(expected));
-        REQUIRE((x - expected).norm() < 1e-12 * expected.norm());
+        REQUIRE((x - expected).norm() < solveTolerance(factorizer) * expected.norm());
     }
 
     SECTION("only plain, unpermuted solves with A are supported") {
@@ -125,8 +137,15 @@ TEST_CASE("cuDSS rejects indefinite matrices and unsupported solves", "[cudss]")
     }
 
     SECTION("numeric factorization before symbolic throws") {
-        CuDSSFactorizer fresh;
+        CuDSSFactorizer fresh(singlePrecision);
         REQUIRE_THROWS(fresh.factorizeNumeric(A));
     }
+}
+
+TEST_CASE("cuDSS factory honors singlePrecision", "[cudss]") {
+    const bool singlePrecision = GENERATE(false, true);
+    auto f = make_cholesky_factorizer(CholeskyProvider::CUDSS, singlePrecision);
+    REQUIRE(f->provider() == CholeskyProvider::CUDSS);
+    REQUIRE(dynamic_cast<const CuDSSFactorizer &>(*f).isSinglePrecision() == singlePrecision);
 }
 #endif

@@ -27,7 +27,10 @@
 
 namespace MeshFEM {
 
-CuDSSFactorizer::CuDSSFactorizer() {
+CuDSSFactorizer::CuDSSFactorizer(bool singlePrecision)
+    : m_valueType(singlePrecision ? CUDSS_R_32F : CUDSS_R_64F),
+      m_valueSize(singlePrecision ? sizeof(float) : sizeof(double))
+{
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
 
     /* Create a CUDA stream */
@@ -61,25 +64,14 @@ void CuDSSFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const std:
     int64_t nrows = m_reducedSize, ncols = m_reducedSize;
     int     nrhs = 1;
     int64_t ldb = nrows, ldx = ncols;
-    CUDA_CALL_AND_CHECK(cudaMalloc(&m_b_values_d, nrhs * nrows * sizeof(Real)), "cudaMalloc for b_values");
-    CUDA_CALL_AND_CHECK(cudaMalloc(&m_x_values_d, nrhs * ncols * sizeof(Real)), "cudaMalloc for x_values");
+    CUDA_CALL_AND_CHECK(cudaMalloc(&m_b_values_d, nrhs * nrows * m_valueSize), "cudaMalloc for b_values");
+    CUDA_CALL_AND_CHECK(cudaMalloc(&m_x_values_d, nrhs * ncols * m_valueSize), "cudaMalloc for x_values");
     CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&m_b, nrows, nrhs, ldb, m_b_values_d,
-                                             CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR),
+                                             m_valueType, CUDSS_LAYOUT_COL_MAJOR),
                          status, "cudssMatrixCreateDn for b");
     CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&m_x, ncols, nrhs, ldx, m_x_values_d,
-                                             CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR),
+                                             m_valueType, CUDSS_LAYOUT_COL_MAJOR),
                          status, "cudssMatrixCreateDn for x");
-
-    /* Choose the fill-reducing ordering computed during the analysis */
-    cudssReorderingAlg_t reorder_alg = CUDSS_REORDERING_ALG_DEFAULT;
-    switch (orderingMethod) {
-        case OrderingMethod::Default:          reorder_alg = CUDSS_REORDERING_ALG_DEFAULT;            break;
-        case OrderingMethod::AMD:              reorder_alg = CUDSS_REORDERING_ALG_AMD;                break;
-        case OrderingMethod::NestedDissection: reorder_alg = CUDSS_REORDERING_ALG_NESTED_DISSECTION;  break;
-    }
-    CUDSS_CALL_AND_CHECK(cudssConfigSet(m_config, CUDSS_CONFIG_REORDERING_ALG,
-                                        &reorder_alg, sizeof(cudssReorderingAlg_t)),
-                         status, "cudssConfigSet for reordering alg");
 
     /* Symbolic factorization (synchronous: returns once the analysis is done) */
     CUDSS_CALL_AND_CHECK(cudssExecute(m_handle, CUDSS_PHASE_ANALYSIS, m_config, m_data, A_cudss, m_x, m_b),
@@ -157,8 +149,13 @@ void CuDSSFactorizer::solveRawReduced(const Real *b, Real *x, CholeskySys sys, b
     if ((size_t(nrows_b) != m_reducedSize) || (size_t(nrows_x) != m_reducedSize))
         throw std::logic_error("[cuDSS] b/x size does not match the factorized system; was factorizeSymbolic skipped?");
 
-    /* Copy host memory to device for b */
-    CUDA_CALL_AND_CHECK(cudaMemcpy(m_b_values_d, b, m_reducedSize * sizeof(Real), cudaMemcpyHostToDevice),
+    /* Copy host memory to device for b (converted to float first in single precision) */
+    const void *b_src = b;
+    if (isSinglePrecision()) {
+        m_floatVector = Eigen::Map<const Eigen::VectorXd>(b, m_reducedSize).cast<float>();
+        b_src = m_floatVector.data();
+    }
+    CUDA_CALL_AND_CHECK(cudaMemcpy(m_b_values_d, b_src, m_reducedSize * m_valueSize, cudaMemcpyHostToDevice),
                         "cudaMemcpy for b_values");
 
     /* Solving */
@@ -168,9 +165,12 @@ void CuDSSFactorizer::solveRawReduced(const Real *b, Real *x, CholeskySys sys, b
     /* Wait for the solve to finish before reading x */
     CUDA_CALL_AND_CHECK(cudaStreamSynchronize(m_stream), "cudaStreamSynchronize after solve");
 
-    /* Copy the solution back to the host */
-    CUDA_CALL_AND_CHECK(cudaMemcpy(x, m_x_values_d, m_reducedSize * sizeof(Real), cudaMemcpyDeviceToHost),
+    /* Copy the solution back to the host (converted back to double in single precision) */
+    void *x_dst = isSinglePrecision() ? static_cast<void *>(m_floatVector.data()) : static_cast<void *>(x);
+    CUDA_CALL_AND_CHECK(cudaMemcpy(x_dst, m_x_values_d, m_reducedSize * m_valueSize, cudaMemcpyDeviceToHost),
                         "cudaMemcpy for x_values");
+    if (isSinglePrecision())
+        Eigen::Map<Eigen::VectorXd>(x, m_reducedSize) = m_floatVector.cast<double>();
 }
 
 void CuDSSFactorizer::clearFactors() {
@@ -229,7 +229,7 @@ void CuDSSFactorizer::m_copyPatternToDevice(const SuiteSparseMatrix &A) {
     /* Allocate device memory for A */
     CUDA_CALL_AND_CHECK(cudaMalloc(&m_rowStart_d,   (n + 1) * sizeof(int)), "cudaMalloc for csr_offsets");
     CUDA_CALL_AND_CHECK(cudaMalloc(&m_colIndices_d, nnz * sizeof(int)),     "cudaMalloc for csr_columns");
-    CUDA_CALL_AND_CHECK(cudaMalloc(&m_values_d,     nnz * sizeof(Real)),    "cudaMalloc for csr_values");
+    CUDA_CALL_AND_CHECK(cudaMalloc(&m_values_d,     nnz * m_valueSize),     "cudaMalloc for csr_values");
 
     /* Copy host memory to device for A (the values are copied by m_copyValuesToDevice) */
     CUDA_CALL_AND_CHECK(cudaMemcpy(m_rowStart_d,   csr_offsets_h.data(), (n + 1) * sizeof(int), cudaMemcpyHostToDevice), "cudaMemcpy for csr_offsets");
@@ -241,7 +241,7 @@ void CuDSSFactorizer::m_copyPatternToDevice(const SuiteSparseMatrix &A) {
     cudssIndexBase_t      base  = CUDSS_BASE_ZERO;
     CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&A_cudss, n, n, nnz, m_rowStart_d, NULL,
                                               m_colIndices_d, m_values_d, CUDSS_R_32I,
-                                              CUDSS_R_32I, CUDSS_R_64F, mtype, mview,
+                                              CUDSS_R_32I, m_valueType, mtype, mview,
                                               base),
                          status, "cudssMatrixCreateCsr");
 }
@@ -250,6 +250,26 @@ void CuDSSFactorizer::m_copyValuesToDevice(const SuiteSparseMatrix &  A , Real  
     BENCHMARK_SCOPED_TIMER_SECTION timer("CuDSSFactorizer.m_copyValuesToDevice");
     // m_values_d was allocated for m_nnz values; copying more would overrun it.
     if (A.nz != m_nnz) throw std::runtime_error("[cuDSS] Sparsity pattern changed since the symbolic factorization");
+
+    if (isSinglePrecision()) {
+        // Convert to float on the CPU; the shift is added in double first, so each value is rounded only once.
+        m_floatValues.resize(A.nz);
+        tbb::parallel_for(tbb::blocked_range<SuiteSparse_long>(0, A.n),
+            [&](const tbb::blocked_range<SuiteSparse_long> &r) {
+                for (SuiteSparse_long j = r.begin(); j < r.end(); ++j) {
+                    for (SuiteSparse_long ii = A.Ap[j]; ii < A.Ap[j + 1]; ++ii)
+                        m_floatValues[ii] = float(A.Ax[ii]);
+                    if (sigma != 0) {
+                        const SuiteSparse_long d = A.findDiagEntry(j);
+                        m_floatValues[d] = float(A.Ax[d] + sigma);
+                    }
+                }
+            });
+
+        // CPU → GPU (half the bytes of the double version).
+        CUDA_CALL_AND_CHECK(cudaMemcpy(m_values_d, m_floatValues.data(), A.nz * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy for values");
+        return;
+    }
 
     const Real *src = A.Ax.data();          // sigma == 0: upload A's values directly
 

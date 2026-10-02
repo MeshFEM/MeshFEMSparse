@@ -25,7 +25,10 @@ struct MESHFEM_EXPORT CuDSSFactorizer final : public CholeskyFactorizerBase {
     enum class OrderingMethod { Default, AMD, NestedDissection };
     OrderingMethod orderingMethod = OrderingMethod::Default;
 
-    CuDSSFactorizer();
+    // With `singlePrecision`, cuDSS factorizes and solves in float; the inputs
+    // and outputs (matrix values, b, x) remain double, as for Accelerate.
+    CuDSSFactorizer(bool singlePrecision = false);
+    bool isSinglePrecision() const { return m_valueType == CUDSS_R_32F; }
 
     // *Scalar* size of the reduced (pin-removed) system.
     size_t m_reduced() const override { return m_reducedSize; }
@@ -85,6 +88,10 @@ private:
     cudssConfig_t m_config = nullptr;
     cudssData_t   m_data   = nullptr;
 
+    // Precision of everything stored on the GPU (values, b, x): set once in the constructor.
+    cudssDataType_t m_valueType = CUDSS_R_64F; // CUDSS_R_32F (float) or CUDSS_R_64F (double)
+    size_t          m_valueSize = sizeof(double); // Bytes per value on the GPU: 4 or 8
+
     // The row/col-removed matrix handed to cuDSS; its arrays live on the GPU.
     // MeshFEM stores the upper triangle in CSC format. Read as CSR, the same
     // arrays describe the lower triangle, so we upload them unchanged and
@@ -92,15 +99,17 @@ private:
     cudssMatrix_t A_cudss = nullptr;
     int  *m_rowStart_d   = nullptr; // CSR row offsets    (= CSC column pointers `Ap`)
     int  *m_colIndices_d = nullptr; // CSR column indices (= CSC row indices `Ai`)
-    Real *m_values_d     = nullptr; // CSR values         (= CSC values `Ax`)
+    void *m_values_d     = nullptr; // CSR values         (= CSC values `Ax`), float or double
 
     // Right-hand side b and solution x (dense, one column) on the GPU, with
     // their wrappers. cudssExecute needs them in every phase, and the solve
     // copies into/out of them.
     cudssMatrix_t m_b = nullptr, m_x = nullptr;
-    Real *m_b_values_d = nullptr, *m_x_values_d = nullptr;
+    void *m_b_values_d = nullptr, *m_x_values_d = nullptr; // float or double
 
-    VecX_T<Real> m_shiftedValues; // Host staging buffer for the values of `A + sigma I`.
+    VecX_T<Real> m_shiftedValues;     // Host staging buffer for the values of `A + sigma I` (double precision).
+    std::vector<float> m_floatValues; // Host staging buffer for the values of `A + sigma I` (single precision).
+    mutable Eigen::VectorXf m_floatVector; // Host staging buffer for b, then x, in single-precision solves.
 
     size_t m_reducedSize = 0;
     SuiteSparse_long m_nnz = 0;
