@@ -70,6 +70,17 @@ void CuDSSFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const std:
                                              CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR),
                          status, "cudssMatrixCreateDn for x");
 
+    /* Choose the fill-reducing ordering computed during the analysis */
+    cudssReorderingAlg_t reorder_alg = CUDSS_REORDERING_ALG_DEFAULT;
+    switch (orderingMethod) {
+        case OrderingMethod::Default:          reorder_alg = CUDSS_REORDERING_ALG_DEFAULT;            break;
+        case OrderingMethod::AMD:              reorder_alg = CUDSS_REORDERING_ALG_AMD;                break;
+        case OrderingMethod::NestedDissection: reorder_alg = CUDSS_REORDERING_ALG_NESTED_DISSECTION;  break;
+    }
+    CUDSS_CALL_AND_CHECK(cudssConfigSet(m_config, CUDSS_CONFIG_REORDERING_ALG,
+                                        &reorder_alg, sizeof(cudssReorderingAlg_t)),
+                         status, "cudssConfigSet for reordering alg");
+
     /* Symbolic factorization (synchronous: returns once the analysis is done) */
     CUDSS_CALL_AND_CHECK(cudssExecute(m_handle, CUDSS_PHASE_ANALYSIS, m_config, m_data, A_cudss, m_x, m_b),
                          status, "cudssExecute for analysis");

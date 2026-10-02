@@ -20,6 +20,11 @@
 namespace MeshFEM {
 
 struct MESHFEM_EXPORT CuDSSFactorizer final : public CholeskyFactorizerBase {
+    // Fill-reducing ordering computed by cuDSS during the analysis
+    // (CUDSS_CONFIG_REORDERING_ALG); takes effect at the next factorizeSymbolic.
+    enum class OrderingMethod { Default, AMD, NestedDissection };
+    OrderingMethod orderingMethod = OrderingMethod::Default;
+
     CuDSSFactorizer();
 
     // *Scalar* size of the reduced (pin-removed) system.
