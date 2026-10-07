@@ -540,6 +540,52 @@ ConversionPlan constructBlockConversionPlan(const catamari::CoordinateMatrix<Fie
     return cplan;
 }
 
+// Construct the scalar overrides needed to implement the variable pin constraints
+// indicated by `pins` using "identity pinning" rather than row/col removal.
+// Note that these overrides are applied to the permuted matrix and must therefore
+// account for the reordering of `ldl`.
+template<class Field>
+void setPinOverrides(ConversionPlan &plan, const catamari::SparseLDL<Field> &ldl,
+                     const std::vector<size_t> &pins) {
+    plan.overrides.clear();
+    plan.overrideColumnOffsets.resize(0);
+    if (pins.empty()) return;
+    const auto &f = *ldl.supernodal_factorization;
+    const auto &o = f.ordering_;
+    const auto &lf = *f.lower_factor_;
+    const Int n = ldl.NumRows(), structureBlockSize = lf.IndexBlockSize();
+    const Int planBlockSize = plan.isBlock ? structureBlockSize : 1;
+    std::vector<bool> fixed(n, false);
+    for (size_t i : pins) fixed[o.permutation[i]] = true;
+    plan.overrideColumnOffsets.resize(n + 1);
+    plan.overrideColumnOffsets[0] = 0;
+    const Field *values = f.factor_values_.Data();
+    for (Int sn = 0; sn < Int(o.supernode_sizes.Size()); ++sn) {
+        const Int start = o.supernode_offsets[sn],
+                   size = o.supernode_sizes[sn];
+        const auto &db = f.diagonal_factor_->blocks[sn];
+        const Int *rows = lf.StructureBeg(sn);
+        for (Int j = start; j < start + size; j += planBlockSize) {
+            const auto *begin = plan.isBlock ? plan.columnDataBegin(j / planBlockSize, false) : plan.columnData(j);
+            const auto   *end = plan.isBlock ? plan.columnDataEnd  (j / planBlockSize,  true) : plan.columnData(j + 1);
+            const Int firstLocOfColumn = db.Pointer(0, j - start) - values;
+            for (Int cj = 0; cj < planBlockSize; ++cj) {
+                for (auto e = begin; e != end; ++e) {
+                    const Int frontal_row = e->dst - firstLocOfColumn;
+                    const Int i = frontal_row < size ? start + frontal_row // In diagonal block...
+                                : rows[(frontal_row - size) / structureBlockSize] + (frontal_row - size) % structureBlockSize; // In lower block; needs row index lookup.
+                    for (Int ci = 0; ci < planBlockSize; ++ci) {
+                        if (fixed[i + ci] || fixed[j + cj])
+                            plan.overrides.push_back({e->dst + ci + cj * db.leading_dim,
+                                                      ((i + ci) == (j + cj)) ? 1.0 : 0.0});
+                    }
+                }
+                plan.overrideColumnOffsets[j + cj + 1] = plan.overrides.size(); // finalize override column.
+            }
+        }
+    }
+}
+
 // A_scalar should be nonreduced!
 template<class Field>
 void validate(const catamari::ConversionPlan &cplan, const catamari::SparseLDL<Field> &ldl_scalar, const SuiteSparseMatrix &A_scalar, const std::vector<SuiteSparse_long> &reducedRowForRow_scalar, size_t numReducedRows) {

@@ -46,6 +46,25 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
     CatamariFactorizer(bool legacy = false);
     CatamariFactorizer(bool legacy, bool singlePrecision);
 
+#ifndef MESHFEM_USE_LEGACY_CATAMARI
+    // Preserve the full sparsity/block structure and impose pins during
+    // conversion-plan injection. Changing mode clears existing factors.
+    void setIdentityPinning(bool enabled);
+    bool getIdentityPinning() const { return m_identityPinning; }
+    bool retainsFixedVariables() const override { return m_identityPinning; }
+
+    template<class Mat>
+    void updateFixedVarsImpl(const Mat &mat, const std::vector<size_t> &pins) {
+        if (!m_identityPinning || !hasFactorization(FactorizationType::Symbolic)) {
+            factorizeSymbolic(mat, pins);
+            return;
+        }
+        m_updateIdentityPins(pins);
+    }
+    void updateFixedVars(const SuiteSparseMatrix &mat, const std::vector<size_t> &pins) override { updateFixedVarsImpl(mat, pins); }
+    void updateFixedVars(const BlockCSCHessianBase &mat, const std::vector<size_t> &pins) override { updateFixedVarsImpl(mat, pins); }
+#endif
+
     size_t m_reduced() const override;
     size_t n_reduced() const override;
 
@@ -228,6 +247,12 @@ private:
     template<class Field>
     void m_numericFactorizationImpl(State<Field> &state, const SuiteSparseMatrix &A, Real sigma, const SuiteSparseMatrix *B);
     void m_numericFactorizationImpl(const SuiteSparseMatrix &A, Real sigma = 0, const SuiteSparseMatrix *B = nullptr);
+#endif
+
+#ifndef MESHFEM_USE_LEGACY_CATAMARI
+    bool m_identityPinning = false;
+    void m_updateIdentityPins(std::vector<size_t> pins);
+    void m_zeroPinnedRHS(Real *rhs, bool permuted) const;
 #endif
 
     CholmodOrdering m_cholmodOrdering;

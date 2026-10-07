@@ -13,8 +13,9 @@ namespace {
 template<class Matrix>
 void checkSolves(Matrix &A, const SuiteSparseMatrix &scalarA, bool single,
                  bool left, CatamariFactorizer::OrderingMethod ordering,
-                 const std::vector<size_t> &pins, bool blockAccel = true) {
+                 const std::vector<size_t> &pins, bool blockAccel = true, bool identityPins = false) {
     CatamariFactorizer f(false, single);
+    f.setIdentityPinning(identityPins);
     f.orderingMethod = ordering;
     f.setUseLeftLooking(left);
     f.setUseBlockAccel(blockAccel);
@@ -98,7 +99,7 @@ void checkSolves(Matrix &A, const SuiteSparseMatrix &scalarA, bool single,
 }
 
 template<size_t BS>
-void checkBlocks(bool single, bool left, CatamariFactorizer::OrderingMethod ordering, int pinMode, bool contiguous, bool blockAccel) {
+void checkBlocks(bool single, bool left, CatamariFactorizer::OrderingMethod ordering, int pinMode, bool contiguous, bool blockAccel, bool identityPins = false) {
     SystemAssembler<BS> assembler(20);
     auto pattern = assembler.blockSparsityPattern(19, [](size_t i) { return std::array<size_t, 2>{{i, i + 1}}; });
     pattern->setZero();
@@ -113,11 +114,11 @@ void checkBlocks(bool single, bool left, CatamariFactorizer::OrderingMethod orde
     if (pinMode == 2) pins.push_back(1);
     if (contiguous) {
         auto A = pattern->template cloneWithLayout<true>();
-        checkSolves(*A, scalar, single, left, ordering, pins, blockAccel);
+        checkSolves(*A, scalar, single, left, ordering, pins, blockAccel, identityPins);
     }
     else {
         auto A = pattern->template cloneWithLayout<false>();
-        checkSolves(*A, scalar, single, left, ordering, pins, blockAccel);
+        checkSolves(*A, scalar, single, left, ordering, pins, blockAccel, identityPins);
     }
 }
 }
@@ -160,6 +161,70 @@ TEST_CASE("Catamari precision preserves scalar and block solver behavior", "[cat
         SuiteSparseMatrix reference = A;
         checkSolves(A, reference, single, left, ordering, pinMode ? std::vector<size_t>{1} : std::vector<size_t>{});
     }
+}
+
+TEST_CASE("Catamari conversion-plan pins preserve block solves", "[catamari][identity_pins]") {
+    tbb::global_control limit(tbb::global_control::max_allowed_parallelism, 4);
+    const bool single = GENERATE(false, true);
+    const bool left = GENERATE(false, true);
+    const auto ordering = GENERATE(CatamariFactorizer::OrderingMethod::Native, CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
+    const bool contiguous = GENERATE(false, true);
+    SECTION("scalar") { checkBlocks<1>(single, left, ordering, 2, contiguous, true, true); }
+    SECTION("partial 2D block") { checkBlocks<2>(single, left, ordering, 2, contiguous, true, true); }
+    SECTION("partial 3D block") { checkBlocks<3>(single, left, ordering, 2, contiguous, true, true); }
+    SECTION("disabled block acceleration") { checkBlocks<2>(single, left, ordering, 2, contiguous, false, true); }
+}
+
+TEST_CASE("Catamari identity pins update without changing symbolic analysis", "[catamari][identity_pins]") {
+    tbb::global_control limit(tbb::global_control::max_allowed_parallelism, 4);
+    SystemAssembler<2> assembler(20);
+    auto H = assembler.blockSparsityPattern(19, [](size_t i) { return std::array<size_t, 2>{{i, i + 1}}; });
+    H->setZero();
+    for (auto e : H->toScalar()) H->addNZScalar(e.i, e.j, e.i == e.j ? 5.0 : -.125);
+    auto A = H->cloneWithContiguousBlocks();
+    const auto originalValues = A->Ax;
+    CatamariFactorizer f;
+    f.setIdentityPinning(true);
+    f.factorizeSymbolic(*A, {});
+    const auto permutation = f.getInversePermutation();
+    const auto nnz = f.getFactorNNZ();
+    const auto *nd = f.ndOrdering() ? &*f.ndOrdering() : nullptr;
+    auto check = [&](const std::vector<size_t> &pins, bool cloned = false) {
+        Eigen::VectorXd expected = Eigen::VectorXd::Random(40);
+        for (size_t i : pins) expected[i] = 0;
+        auto rhs = A->apply(expected);
+        for (size_t i : pins) rhs[i] = 17; // Must ignore the supplied pinned RHS.
+        REQUIRE((f.solve(rhs) - expected).norm() < 1e-11);
+        REQUIRE(f.n() == 40);
+        REQUIRE(f.n_reduced() == 40);
+        // BlockCatamari clones currently omit the cached NNZ statistic.
+        if (!cloned) REQUIRE(f.getFactorNNZ() == nnz);
+        REQUIRE(f.getInversePermutation() == permutation);
+        if (!cloned) REQUIRE((f.ndOrdering() ? &*f.ndOrdering() : nullptr) == nd);
+        REQUIRE(A->Ax == originalValues);
+    };
+    const std::vector<std::vector<size_t>> masks{{1}, {0, 1, 39}, {}, {17, 23}};
+    for (const auto &pins : masks) {
+        f.updateFixedVars(*A, pins);
+        REQUIRE_FALSE(f.hasNumericFactorization());
+        f.factorizeNumeric(*A);
+        check(pins);
+    }
+    // Pins travel with stashed numeric factors.
+    f.stashFactorization();
+    f.updateFixedVars(*A, {0});
+    f.factorizeNumeric(*A);
+    f.swapStashedFactorization();
+    check(masks.back(), true);
+    f.swapStashedFactorization();
+    check({0}, true);
+    REQUIRE_THROWS(f.updateFixedVars(*A, {40}));
+    f.clearStashedFactorization();
+    std::vector<size_t> all(40);
+    std::iota(all.begin(), all.end(), 0);
+    f.updateFixedVars(*A, all);
+    f.factorizeNumeric(*A);
+    REQUIRE(f.solve(Eigen::VectorXd(Eigen::VectorXd::Ones(40))).norm() == 0);
 }
 
 TEST_CASE("Catamari precision factory rejects legacy mode", "[catamari][precision]") {

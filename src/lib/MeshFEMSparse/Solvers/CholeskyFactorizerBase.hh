@@ -62,11 +62,17 @@ struct CholeskyFactorizerBase {
         None = 0, Symbolic = 1, Numeric = 2
     };
 
-    size_t m() const { return m_reduced() + m_fixedVars.size(); }
-    size_t n() const { return n_reduced() + m_fixedVars.size(); }
+    size_t m() const { return retainsFixedVariables() ? m_reduced() : m_reduced() + m_fixedVars.size(); }
+    size_t n() const { return retainsFixedVariables() ? n_reduced() : n_reduced() + m_fixedVars.size(); }
 
+    // Dimensions of the "reduced" system actually factorized after
+    // imposing pin constraints. When pinned variables are removed from
+    // the system, the reduced system is smaller than the full one by
+    // `m_fixedVars.size()`. When the pinned variables are retained,
+    // then the reduced and full systems are the same size.
     virtual size_t m_reduced() const = 0;
     virtual size_t n_reduced() const = 0;
+    virtual bool retainsFixedVariables() const { return false; }
 
     bool hasFixedVars() const { return !m_fixedVars.empty(); }
     const std::vector<size_t> &getFixedVars() const { return m_fixedVars; }
@@ -94,6 +100,14 @@ struct CholeskyFactorizerBase {
     // rows and columns indicated by the indices in `pinnedVars`.
     virtual void factorizeSymbolic(const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars) = 0;
     void factorizeSymbolic(const SuiteSparseMatrix &mat) { factorizeSymbolic(mat, std::vector<size_t>()); }
+
+    // Notify that variable pins have changed (but the sparsity pattern has not).
+    // Factorizers implementing an "identity pinning" approach need not rerun
+    // analysis, but the default row/column removal approach requires a new
+    // symbolic factorization. Regardless of the pinning strategy, the numeric
+    // factorization is invalidated and must be recomputed before new solves.
+    virtual void updateFixedVars(const SuiteSparseMatrix &mat, const std::vector<size_t> &pins)   { factorizeSymbolic(mat, pins); }
+    virtual void updateFixedVars(const BlockCSCHessianBase &mat, const std::vector<size_t> &pins) { factorizeSymbolic(mat, pins); }
 
     // (Re)compute the numeric factorization, reusing the symbolic factorization
     // if it exists; otherwise a symbolic factorization is computed.
@@ -267,7 +281,7 @@ struct CholeskyFactorizerBase {
         x.resize(n());
         m_solveScratch.resize(n()); // always the full unreduced size to support swapping with `x`
 
-        if (hasFixedVars()) {
+        if (hasFixedVars() && !retainsFixedVariables()) {
             if (preferInPlaceSolve()) {
                 const bool permute = supportsPrePermutation();
                 removeFixedEntries(b, m_solveScratch.head(n_reduced()), permute);
@@ -297,8 +311,10 @@ struct CholeskyFactorizerBase {
     // `permute`: whether to also apply the permutation/inverse permutation in a fused operation.
     template<class VecIn, class VecOut>
     void extractFullSolution(const VecIn &xReduced, VecOut &&x, bool permute = false) const {
-        if (!hasFixedVars() && !permute) {
+        if ((!hasFixedVars() || retainsFixedVariables()) && !permute) {
             x = xReduced;
+            if (retainsFixedVariables())
+                for (size_t i : m_fixedVars) x.row(i).setZero();
             return;
         }
 
@@ -327,12 +343,16 @@ struct CholeskyFactorizerBase {
                 x_ptr[i] = (row != SuiteSparseMatrix::INDEX_NONE) ? xR_ptr[row] : 0.0;
             }
         }
+        if (retainsFixedVariables())
+            for (size_t i : m_fixedVars) x.row(i).setZero();
     }
 
     template<class VecIn, class VecOut>
     void removeFixedEntries(const VecIn &x, VecOut &&xReduced, bool permute = false) const {
-        if (!hasFixedVars() && !permute) {
+        if ((!hasFixedVars() || retainsFixedVariables()) && !permute) {
             xReduced = x;
+            if (retainsFixedVariables())
+                for (size_t i : m_fixedVars) xReduced.row(i).setZero();
             return;
         }
 
@@ -360,13 +380,16 @@ struct CholeskyFactorizerBase {
                 if (row != SuiteSparseMatrix::INDEX_NONE) xR_ptr[row] = x_ptr[i];
             }
         }
+        if (retainsFixedVariables())
+            for (size_t i : m_fixedVars) xReduced.row(reducedRowForRow[i]).setZero();
     }
 
     bool varIsFixed(size_t i) const { return std::find(m_fixedVars.begin(), m_fixedVars.end(), i) != m_fixedVars.end(); }
 
     // Raw pointer versions (Use with care! Caller must allocate/own both pointers)
-    // These calls are for the *reduced* system obtained after row/col reduction.
-    // (b and x should be the reduced right-hand-side and x, respectively).
+    // These calls use the underlying system dimensions m_reduced()/n_reduced().
+    // An implementation retaining fixed variables must ignore pinned RHS entries and
+    // return zero at those slots; otherwise callers must remove them first.
     virtual void solveRawReduced(const Real *b, Real *x, CholeskySys sys = CholeskySys::A, bool alreadyPermuted = false) const = 0;
     virtual void solveRawReducedInPlace(Real *bx, CholeskySys sys = CholeskySys::A, bool alreadyPermuted = false) const { UNUSED(bx); UNUSED(sys); UNUSED(alreadyPermuted); throw std::runtime_error("Unimplemented"); }
     // Which version of solve is "native"?

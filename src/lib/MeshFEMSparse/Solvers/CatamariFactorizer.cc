@@ -42,6 +42,7 @@ struct CatamariFactorizer::State {
     std::unique_ptr<catamari::SparseLDL<Field>> ldl = std::make_unique<catamari::SparseLDL<Field>>();
     std::unique_ptr<catamari::SparseLDL<Field>> stash;
     bool nativeOrdering = false, stashNativeOrdering = false;
+    std::vector<size_t> stashPins;
     FactorizationType stashType = FactorizationType::None;
     std::unique_ptr<catamari::SparseLDLControl<Field>> control = std::make_unique<catamari::SparseLDLControl<Field>>();
     std::unique_ptr<CatamariConverterT<Field>> converter;
@@ -113,6 +114,40 @@ void CatamariFactorizer::clearFactors() {
     m_factorizationType = FactorizationType::None;
 }
 
+void CatamariFactorizer::setIdentityPinning(bool enabled) {
+    if (enabled == m_identityPinning) return;
+    if (enabled && m_legacy) throw std::invalid_argument("Identity pinning requires modern Catamari");
+    clearStashedFactorization();
+    clearFactors();
+    m_fixedVars.clear();
+    m_identityPinning = enabled;
+}
+
+void CatamariFactorizer::m_updateIdentityPins(std::vector<size_t> pins) {
+    assertFactorization(FactorizationType::Symbolic);
+    const size_t nfull = m_reduced();
+    std::sort(pins.begin(), pins.end());
+    pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
+    for (size_t i : pins)
+        if (i >= nfull) throw std::out_of_range("Fixed variable index out of range");
+    invalidateNumericFactorization();
+    m_withState([&](auto &state) {
+        catamari_conversion_plan::setPinOverrides(state.converter->conversionPlan, *state.ldl, pins);
+    });
+    m_fixedVars = std::move(pins);
+    // Full-size identity mapping, including pinned slots. The base class zeros
+    // these slots when preparing RHSs/extracting solutions.
+    m_reducedRowForRow.resize(nfull);
+    std::iota(m_reducedRowForRow.begin(), m_reducedRowForRow.end(), 0);
+    m_permutedReducedRowForRow.clear();
+}
+
+void CatamariFactorizer::m_zeroPinnedRHS(Real *rhs, bool permuted) const {
+    if (!m_identityPinning) return;
+    const auto &p = m_ordering().permutation;
+    for (size_t i : m_fixedVars) rhs[permuted ? p[i] : i] = 0;
+}
+
 void CatamariFactorizer::setUseLeftLooking(bool use_left) {
     return m_withState([&](auto &state) {
         state.control->supernodal_control.algorithm = use_left ? catamari::kLeftLookingLDL : catamari::kRightLookingLDL;
@@ -171,7 +206,13 @@ void CatamariFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const s
 // uniform block size `m_blockSize`.
 // `pinnedVars` always holds scalar variables.
 void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const std::vector<size_t> &pinnedVars) {
-    m_withState([&](auto &state) { m_factorizeSymbolic(state, mat, pinnedVars); });
+    // Stashes share the conversion plan's symbolic layout. A fresh identity
+    // analysis discards an old stash; numeric/pin updates can still be stashed.
+    if (m_identityPinning) clearStashedFactorization();
+    m_withState([&](auto &state) {
+        m_factorizeSymbolic(state, mat, m_identityPinning ? std::vector<size_t>() : pinnedVars);
+    });
+    if (m_identityPinning) m_updateIdentityPins(pinnedVars);
 }
 
 template<class Field>
@@ -815,7 +856,9 @@ void CatamariFactorizer::solveRawReduced(const Real *b, Real *x, CholeskySys sys
         const auto &o = m_ordering();
 
         const catamari::Int solve_block_size = (m_useBlockAccel && !disableBlockSolve) ? m_blockSize : 1;
-        InversePermute(solve_block_size, o.inverse_permutation, v, &v_perm); // Note: InversePermute is faster than Permute due to contiguous writes avoiding false sharing.
+        // InversePermute writes contiguously, avoiding false sharing.
+        InversePermute(solve_block_size, o.inverse_permutation, v, &v_perm);
+        m_zeroPinnedRHS(v_perm.data, true);
 
         {
             BENCHMARK_SCOPED_TIMER_SECTION solveTimer("Catamari Solve");
@@ -842,6 +885,8 @@ void CatamariFactorizer::solveRawReducedInPlace(Real *bx, CholeskySys sys, bool 
         throw std::runtime_error("Alternative CholeskySys not yet wrapped for Catamari");
     }
 
+    alreadyPermuted |= m_withState([](auto &state) { return state.nativeOrdering; });
+    m_zeroPinnedRHS(bx, alreadyPermuted);
     catamari::BlasMatrixView<double> v;
     const size_t s = m_reduced();
     v.height = s;
@@ -874,7 +919,8 @@ void CatamariFactorizer::solveMultiRHS(const Eigen::Matrix<Real, Eigen::Dynamic,
 
     catamari::Int solve_block_size = (m_useBlockAccel && !disableBlockSolve) ? m_blockSize : 1;
 
-    if (hasFixedVars()) {
+    const bool native = m_withState([](auto &state) { return state.nativeOrdering; });
+    if (hasFixedVars() && !(m_identityPinning && native)) {
         Eigen::Matrix<Real, Eigen::Dynamic, Eigen::Dynamic> X_scratch;
         removeFixedEntries(B, X_scratch, /* permute = */ true);
 
@@ -900,6 +946,8 @@ void CatamariFactorizer::solveMultiRHS(const Eigen::Matrix<Real, Eigen::Dynamic,
     }
     else {
         X = B;
+        if (m_identityPinning)
+            for (size_t i : m_fixedVars) X.row(i).setZero();
         v.data = X.data();
         BENCHMARK_SCOPED_TIMER_SECTION timer("Catamari Solve");
         m_withState([&](auto &state) { state.solve(&v, solve_block_size, /* alreadyPermuted = */ false); });
@@ -928,6 +976,7 @@ void CatamariFactorizer::stashFactorization() {
         state.stash = state.ldl->Clone();
         state.stashType = m_factorizationType;
         state.stashNativeOrdering = state.nativeOrdering;
+        state.stashPins = m_fixedVars;
     });
 }
 bool CatamariFactorizer::hasStashedFactorization() const {
@@ -941,6 +990,13 @@ void CatamariFactorizer::swapStashedFactorization() {
         std::swap(state.nativeOrdering, state.stashNativeOrdering);
         std::swap(m_factorizationType, state.stashType);
         m_permutedReducedRowForRow.clear();
+        if (m_identityPinning) {
+            auto pins = state.stashPins;
+            state.stashPins = m_fixedVars;
+            const auto restoredType = m_factorizationType;
+            m_updateIdentityPins(std::move(pins));
+            m_factorizationType = restoredType;
+        }
     });
 }
 void CatamariFactorizer::clearStashedFactorization() {
