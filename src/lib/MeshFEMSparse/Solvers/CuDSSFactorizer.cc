@@ -73,9 +73,14 @@ void CuDSSFactorizer::factorizeSymbolic(const SuiteSparseMatrix &mat, const std:
                                              m_valueType, CUDSS_LAYOUT_COL_MAJOR),
                          status, "cudssMatrixCreateDn for x");
 
-    /* Symbolic factorization (synchronous: returns once the analysis is done) */
-    CUDSS_CALL_AND_CHECK(cudssExecute(m_handle, CUDSS_PHASE_ANALYSIS, m_config, m_data, A_cudss, m_x, m_b),
-                         status, "cudssExecute for analysis");
+    /* Symbolic factorization (timed separately from the allocations/copies above) */
+    {
+        BENCHMARK_SCOPED_TIMER_SECTION executeTimer("CuDSS Analysis Execute");
+        CUDSS_CALL_AND_CHECK(cudssExecute(m_handle, CUDSS_PHASE_ANALYSIS, m_config, m_data, A_cudss, m_x, m_b),
+                             status, "cudssExecute for analysis");
+        /* Make sure any GPU work of the analysis is finished before stopping the timer */
+        CUDA_CALL_AND_CHECK(cudaStreamSynchronize(m_stream), "cudaStreamSynchronize after analysis");
+    }
 
     m_factorizationType = FactorizationType::Symbolic;
 }
@@ -111,12 +116,16 @@ void CuDSSFactorizer::factorizeNumericWithShift(const SuiteSparseMatrix &A, Real
     CUDSS_CALL_AND_CHECK(cudssDataSet(m_handle, m_data, CUDSS_DATA_INFO, &info, sizeof(info)),
                          status, "cudssDataSet for info");
 
-    /* Factorization (asynchronous: only queued on m_stream) */
-    CUDSS_CALL_AND_CHECK(cudssExecute(m_handle, CUDSS_PHASE_FACTORIZATION, m_config, m_data, A_cudss, m_x, m_b),
-                         status, "cudssExecute for factor");
+    /* Factorization (timed separately from m_copyValuesToDevice above) */
+    {
+        BENCHMARK_SCOPED_TIMER_SECTION executeTimer("CuDSS Factorization Execute");
+        /* Asynchronous: only queued on m_stream */
+        CUDSS_CALL_AND_CHECK(cudssExecute(m_handle, CUDSS_PHASE_FACTORIZATION, m_config, m_data, A_cudss, m_x, m_b),
+                             status, "cudssExecute for factor");
 
-    /* Wait for the factorization to finish before checking its result */
-    CUDA_CALL_AND_CHECK(cudaStreamSynchronize(m_stream), "cudaStreamSynchronize after factorization");
+        /* Wait for the factorization to finish before checking its result */
+        CUDA_CALL_AND_CHECK(cudaStreamSynchronize(m_stream), "cudaStreamSynchronize after factorization");
+    }
 
     /* Check for a zero/negative pivot, i.e., a matrix that is not positive definite */
     size_t sizeWritten = 0;
@@ -252,6 +261,7 @@ void CuDSSFactorizer::m_copyValuesToDevice(const SuiteSparseMatrix &  A , Real  
     if (A.nz != m_nnz) throw std::runtime_error("[cuDSS] Sparsity pattern changed since the symbolic factorization");
 
     if (isSinglePrecision()) {
+        BENCHMARK_SCOPED_TIMER_SECTION timer("CuDSSFactorizer.doubleToFloat_cast");
         // Convert to float on the CPU; the shift is added in double first, so each value is rounded only once.
         m_floatValues.resize(A.nz);
         tbb::parallel_for(tbb::blocked_range<SuiteSparse_long>(0, A.n),
