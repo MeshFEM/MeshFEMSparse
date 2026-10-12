@@ -183,7 +183,7 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
         inline static constexpr std::array<double, 2> optimistic_num_time_multiplier_estimates {{0.5, 1.35}};
         // inline static constexpr std::array<double, 2> optimistic_sym_time_multiplier_estimates {{5.0, 0.10}};
         // Adjusted for `CholmodParallelNesdis` (which parallelizes and exploits temporal coherence)
-        inline static constexpr std::array<double, 2> optimistic_sym_time_multiplier_estimates {{1.5, 0.50}};
+        inline static constexpr std::array<double, 2> optimistic_sym_time_multiplier_estimates {{1.5, 0.25}};
     };
 
     mutable AdaptiveOrderingSelection<OrderingChoices> adaptiveOrdering; // mutable so that solve timings can be recorded
