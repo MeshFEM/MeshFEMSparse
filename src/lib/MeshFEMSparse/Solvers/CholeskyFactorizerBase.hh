@@ -20,7 +20,8 @@ enum class CholeskyProvider {
     CHOLMOD, Catamari, CatamariNesdis, CatamariNesdisParallel, CatamariMetis, CatamariLegacy, CatamariAMD, CatamariScotch, CatamariAdaptive, PARDISO, Accelerate,
     CatamariNesdisReuse,
     // Input matrix is already in its desired elimination order.
-    CatamariNative, CHOLMODNative
+    CatamariNative, CHOLMODNative,
+    CUDSS
 };
 
 // Eigen provides a `swap` method rather than overloading `std::swap`

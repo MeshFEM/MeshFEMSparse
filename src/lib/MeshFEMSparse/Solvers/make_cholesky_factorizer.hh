@@ -6,7 +6,7 @@
 namespace MeshFEM {
 
 MESHFEM_EXPORT std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvider provider);
-// Single precision is supported by Accelerate and modern Catamari.
+// Single precision is supported by Accelerate, modern Catamari, and cuDSS.
 MESHFEM_EXPORT std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvider provider, bool singlePrecision);
 
 // Whether the application prefers a cheap symbolic factorization and more

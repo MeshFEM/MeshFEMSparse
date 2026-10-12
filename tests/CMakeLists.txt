@@ -9,6 +9,7 @@ add_executable(MeshFEMSparse_unit_tests
     test_sparsity_lru.cc
     test_block_csc_hessian.cc
     test_accelerate_factorizer.cc
+    test_cudss_factorizer.cc
     test_catamari_solve_kernels.cc
     test_catamari_factorizer.cc
 )
