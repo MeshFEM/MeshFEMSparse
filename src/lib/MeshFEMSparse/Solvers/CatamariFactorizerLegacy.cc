@@ -101,7 +101,10 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
 
         OrderingMethod actualOrderingMethod = orderingMethod;
         if (orderingMethod == OrderingMethod::Adaptive) {
+            const OrderingMethod originalMethod = adaptiveOrdering.currentOrderingMethod();
             actualOrderingMethod = adaptiveOrdering.updateSelection();
+            if (actualOrderingMethod != originalMethod)
+                resetAnalysisPhaseTemporalCache();
             // std::cout << "Adaptive ordering method selected: "
             //           << ((actualOrderingMethod == OrderingMethod::CholmodNesdis) ? "Nesdis" : "AMD")
             //           << "  " << adaptiveOrdering.factorizationTimingDescription();
@@ -312,8 +315,16 @@ void CatamariFactorizer::m_factorizeSymbolic(const SuiteSparseMatrix &mat, const
         }
 
         double sym_fact_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - sym_fact_start).count();
-        if (orderingMethod == OrderingMethod::Adaptive)
-            adaptiveOrdering.recordSymbolic(sym_fact_duration);
+        if (orderingMethod == OrderingMethod::Adaptive) {
+            AnalysisReuseInfo reuse;
+#if MESHFEM_WITH_CHOLMOD
+            if (actualOrderingMethod == OrderingMethod::CholmodNesdisParallel && temporalReusePeriod() > 0) {
+                reuse.incrementalReuseLimit = temporalReusePeriod();
+                reuse.fullRebuild = temporalReuseStatistics().full_rebuild;
+            }
+#endif
+            adaptiveOrdering.recordSymbolic(sym_fact_duration, 0, reuse);
+        }
     }
     else if (orderingMethod == OrderingMethod::AccelerateMetis) {
         auto perm = compute_accelerate_ordering(*A_reduced);

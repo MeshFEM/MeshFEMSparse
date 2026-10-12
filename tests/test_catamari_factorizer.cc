@@ -294,13 +294,61 @@ TEST_CASE("Catamari symbolic reuse resets scalar fallback mappings", "[catamari]
     REQUIRE((f.solve(b) - expected).norm() < (single ? 1e-5 : 1e-12));
 }
 #if MESHFEM_WITH_CHOLMOD
-TEST_CASE("Catamari temporal ND provider defaults to 32 incremental analyses", "[temporal_nd][catamari][factory]") {
+TEST_CASE("Catamari adaptive ordering reports temporal metadata only for ND", "[adaptive_ordering][temporal_nd][catamari]") {
+    auto base = make_cholesky_factorizer(CholeskyProvider::CatamariAdaptive);
+    auto &f = dynamic_cast<CatamariFactorizer &>(*base);
+    f.setTemporalReusePeriod(1);
+    auto &selection = f.adaptiveOrdering;
+    selection.method_switch_threshold_soft = std::numeric_limits<double>::infinity();
+
+    TripletMatrix<> triplets(16, 16);
+    for (size_t v = 0; v < 16; ++v) {
+        triplets.addNZ(v, v, 4);
+        if (v + 1 < 16) triplets.addNZ(v, v + 1, -1);
+    }
+    SuiteSparseMatrix matrix(triplets);
+    matrix.symmetry_mode = SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE;
+    Eigen::VectorXd expected = Eigen::VectorXd::LinSpaced(16, -1, 1);
+    Eigen::VectorXd rhs = matrix.apply(expected);
+    auto analyzeAndSolve = [&]() {
+        f.factorizeSymbolic(matrix, {});
+        f.factorizeNumeric(matrix);
+        REQUIRE((f.solve(rhs) - expected).norm() < 1e-10);
+    };
+    analyzeAndSolve(); // Full ND.
+    analyzeAndSolve(); // Incremental ND.
+    analyzeAndSolve(); // Periodic full ND.
+    const auto &nd = selection.factorization_times_for_method[0];
+    REQUIRE(nd.incrementalReuseLimit == 1);
+    REQUIRE(nd.symbolic.count == 3);
+    REQUIRE(nd.fullAnalysis.count == 2);
+    REQUIRE(nd.incrementalAnalysis.count == 1);
+
+    selection.method_switch_threshold_soft = 0; // Force switches whenever warmup permits.
+    analyzeAndSolve(); // AMD must not inherit the last ND call's statistics.
+    REQUIRE(selection.currentOrderingMethod() == CatamariFactorizer::OrderingMethod::AMD);
+    const auto &amd = selection.factorization_times_for_method[1];
+    REQUIRE(amd.incrementalReuseLimit == 0);
+    REQUIRE(amd.symbolic.count == 1);
+    REQUIRE_FALSE(amd.fullAnalysis.known());
+    REQUIRE_FALSE(amd.incrementalAnalysis.known());
+    analyzeAndSolve(); // Returning from AMD starts with a fresh ND tree.
+    REQUIRE(selection.currentOrderingMethod() == CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
+    REQUIRE(f.temporalReuseStatistics().full_rebuild);
+    analyzeAndSolve(); // Per-switch warmup keeps ND for its second analysis.
+    REQUIRE(selection.currentOrderingMethod() == CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
+    REQUIRE_FALSE(f.temporalReuseStatistics().full_rebuild);
+    analyzeAndSolve();
+    REQUIRE(selection.currentOrderingMethod() == CatamariFactorizer::OrderingMethod::AMD);
+}
+
+TEST_CASE("Catamari temporal ND provider defaults to 64 incremental analyses", "[temporal_nd][catamari][factory]") {
     const bool single = GENERATE(false, true);
     auto base = make_cholesky_factorizer(CholeskyProvider::CatamariNesdisReuse, single);
     auto *f = dynamic_cast<CatamariFactorizer *>(base.get());
     REQUIRE(f != nullptr);
     REQUIRE(f->orderingMethod == CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
-    REQUIRE(f->temporalReusePeriod() == 32);
+    REQUIRE(f->temporalReusePeriod() == 64);
     REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisReuse);
 
     TripletMatrix<> triplets(16, 16);
@@ -310,11 +358,11 @@ TEST_CASE("Catamari temporal ND provider defaults to 32 incremental analyses", "
     }
     SuiteSparseMatrix matrix(triplets);
     matrix.symmetry_mode = SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE;
-    for (size_t call = 0; call < 34; ++call) {
+    for (size_t call = 0; call < 66; ++call) {
         CAPTURE(call, single);
         base->factorizeSymbolic(matrix, {});
         const auto &stats = f->temporalReuseStatistics();
-        const bool full = call == 0 || call == 33;
+        const bool full = call == 0 || call == 65;
         REQUIRE(stats.full_rebuild == full);
         REQUIRE(stats.repartitioned_vertices == (full ? 16 : 0));
     }

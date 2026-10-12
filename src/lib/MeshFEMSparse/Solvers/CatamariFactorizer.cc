@@ -333,7 +333,15 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
           || (orderingMethod == OrderingMethod::AMD) || (orderingMethod == OrderingMethod::Adaptive)) {
         OrderingMethod actualOrderingMethod = orderingMethod;
         if (orderingMethod == OrderingMethod::Adaptive) {
+            const OrderingMethod originalMethod = adaptiveOrdering.currentOrderingMethod();
             actualOrderingMethod = adaptiveOrdering.updateSelection();
+            // Switches can happen after an arbitrary number of symbolic
+            // factorizations/changes to the sparsity pattern. Absent further
+            // information/heuristics, it is best to rerun ordering (e.g.,
+            // nested dissection) from scratch rather than attempting to
+            // incrementally update cached data that is potentially quite stale.
+            if (actualOrderingMethod != originalMethod)
+                resetAnalysisPhaseTemporalCache();
             // std::cout << "Adaptive ordering method selected: "
             //           << ((actualOrderingMethod == OrderingMethod::CholmodNesdis) ? "Nesdis" : "AMD")
             //           << "  " << adaptiveOrdering.factorizationTimingDescription();
@@ -558,8 +566,16 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
 
         double sym_fact_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - sym_fact_start).count();
         m_factorizationType = FactorizationType::Symbolic; // Note: this is needed here for the paranoid assertions in `getFlopEstimate()` and `getFactorNNZ()`
-        if (orderingMethod == OrderingMethod::Adaptive)
-            adaptiveOrdering.recordSymbolic(sym_fact_duration, getFactorNNZ());
+        if (orderingMethod == OrderingMethod::Adaptive) {
+            AnalysisReuseInfo reuse;
+#if MESHFEM_WITH_CHOLMOD
+            if (actualOrderingMethod == OrderingMethod::CholmodNesdisParallel && temporalReusePeriod() > 0) {
+                reuse.incrementalReuseLimit = temporalReusePeriod();
+                reuse.fullRebuild = temporalReuseStatistics().full_rebuild;
+            }
+#endif
+            adaptiveOrdering.recordSymbolic(sym_fact_duration, getFactorNNZ(), reuse);
+        }
         // std::cout << "sym_fact_duration: " << sym_fact_duration << " seconds" << "\tH nnz: " << A_reduced->nz << "\tL nnz: " << getFactorNNZ() << "\tflop count: " << getFlopEstimate() << std::endl;
     }
     else if (orderingMethod == OrderingMethod::AccelerateMetis) {

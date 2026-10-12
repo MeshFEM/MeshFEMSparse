@@ -257,7 +257,7 @@ struct CholeskyFactorizerBase {
 
     // Discard history that would be reused by the next symbolic analysis, e.g.
     // an ND separator tree. Existing factors remain usable until reanalysis.
-    virtual void resetSymbolicFactorizationReuse() { }
+    virtual void resetAnalysisPhaseTemporalCache() { }
 
     void assertFactorization(FactorizationType type)           const { if (!hasFactorization(type)) throw std::runtime_error(((type == FactorizationType::Numeric) ? "Numeric" : "Symbolic") + std::string(" factorization does not exist")); }
     void assertFactorization(CholeskySys sys = CholeskySys::A) const { if (!hasFactorization( sys)) throw std::runtime_error("Factorization does not exist"); }

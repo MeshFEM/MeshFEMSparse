@@ -27,8 +27,15 @@
 #include <stdexcept>
 #include <array>
 #include <sstream>
+#include <cassert>
 
 namespace MeshFEM {
+
+// Metadata for the analysis just completed, independent of the ordering backend.
+struct AnalysisReuseInfo {
+    size_t incrementalReuseLimit = 0; // 0 disables reuse; P allows P incremental analyses after a full rebuild.
+    bool fullRebuild = false;
+};
 
 template<class OrderingChoices>
 struct AdaptiveOrderingSelection {
@@ -57,6 +64,7 @@ struct AdaptiveOrderingSelection {
                       << "  " << factorizationTimingDescription() << std::endl;
             current_method = 1 - current_method;
             factor_nnz_at_last_switch = 0;
+            m_analysesSinceSwitch = 0;
         }
         return currentOrderingMethod();
     }
@@ -83,8 +91,9 @@ struct AdaptiveOrderingSelection {
         solves_per_symbolic_fact_in_window.back()++;
     }
 
-    void recordSymbolic(double time, size_t factor_nnz = 0) {
-        factorization_times_for_method[current_method].symbolic.add(time);
+    void recordSymbolic(double time, size_t factor_nnz = 0, AnalysisReuseInfo reuse = {}) {
+        factorization_times_for_method[current_method].recordAnalysis(time, reuse);
+        ++m_analysesSinceSwitch;
 
         numeric_facts_per_symbolic_fact_in_window.push_back(0);
         if (numeric_facts_per_symbolic_fact_in_window.size() > window_size)
@@ -137,7 +146,7 @@ struct AdaptiveOrderingSelection {
         // estimate based on the currently active method's timings if
         // representative data is not yet available for it.
         // TODO: update to support more than two methods; requires change to multiplier representation in `OrderingChoices`.
-        double avg_sym = factorization_times_for_method[method].symbolic.average(/* default = */ OrderingChoices::optimistic_sym_time_multiplier_estimates[method] * factorization_times_for_method[current_method].symbolic.average());
+        double avg_sym = factorization_times_for_method[method].estimatedAnalysisTime(/* default = */ OrderingChoices::optimistic_sym_time_multiplier_estimates[method] * factorization_times_for_method[current_method].estimatedAnalysisTime());
         double avg_num = factorization_times_for_method[method]. numeric.average(/* default = */ OrderingChoices::optimistic_num_time_multiplier_estimates[method] * factorization_times_for_method[current_method]. numeric.average());
         double avg_sol = factorization_times_for_method[method].   solve.average(/* default = */ OrderingChoices::optimistic_num_time_multiplier_estimates[method] * factorization_times_for_method[current_method].   solve.average());
 
@@ -162,10 +171,10 @@ struct AdaptiveOrderingSelection {
         }
         oss <<    "numericFactorizationsInWindow: " << numericFactorizationsInWindow()
             << "  symbolicFactorizationsInWindow: " << symbolicFactorizationsInWindow()
-            <<             "  Symbolic times (0): " << factorization_times_for_method[0].symbolic.average(-1) << "s"
+            <<             "  Symbolic times (0): " << factorization_times_for_method[0].estimatedAnalysisTime(-1) << "s"
             <<              "  Numeric times (0): " << factorization_times_for_method[0]. numeric.average(-1) << "s"
             <<              "    Solve times (0): " << factorization_times_for_method[0].   solve.average(-1) << "s"
-            <<             "  Symbolic times (1): " << factorization_times_for_method[1].symbolic.average(-1) << "s"
+            <<             "  Symbolic times (1): " << factorization_times_for_method[1].estimatedAnalysisTime(-1) << "s"
             <<              "  Numeric times (1): " << factorization_times_for_method[1]. numeric.average(-1) << "s"
             <<              "    Solve times (1): " << factorization_times_for_method[1].   solve.average(-1) << "s";
         return oss.str();
@@ -221,11 +230,40 @@ struct AdaptiveOrderingSelection {
         FactorizationTime symbolic;
         FactorizationTime numeric;
         FactorizationTime solve;
+        FactorizationTime fullAnalysis, incrementalAnalysis;
+        size_t incrementalReuseLimit = 0;
+
+        void recordAnalysis(double time, AnalysisReuseInfo reuse) {
+            // Preserve actual analysis counts and the ordinary EMA for fallback.
+            symbolic.add(time);
+            if (incrementalReuseLimit != reuse.incrementalReuseLimit) {
+                fullAnalysis = FactorizationTime();
+                incrementalAnalysis = FactorizationTime();
+                incrementalReuseLimit = reuse.incrementalReuseLimit;
+            }
+            if (incrementalReuseLimit > 0)
+                (reuse.fullRebuild ? fullAnalysis : incrementalAnalysis).add(time);
+        }
+
+        double estimatedAnalysisTime(double default_val = 0) const {
+            if ((incrementalReuseLimit > 0) && fullAnalysis.known() && incrementalAnalysis.known()) {
+                const double p = double(incrementalReuseLimit);
+                // Assume a typical case of one full analysis followed by p
+                // incremental analyses; we do not yet model higher-frequency
+                // rebuilds triggered, e.g., by frequent ordering switches or
+                // SparsityLRU hard expirations.
+                return (fullAnalysis.average() + p * incrementalAnalysis.average()) / (p + 1);
+            }
+            return symbolic.average(default_val);
+        }
 
         void reset() {
             symbolic = FactorizationTime();
             numeric  = FactorizationTime();
             solve    = FactorizationTime();
+            fullAnalysis        = FactorizationTime();
+            incrementalAnalysis = FactorizationTime();
+            incrementalReuseLimit = 0;
         }
     };
 
@@ -233,7 +271,14 @@ struct AdaptiveOrderingSelection {
     std::array<FactorizationTimes, 2> factorization_times_for_method;
 
 private:
+    size_t m_analysesSinceSwitch = 0;
+
     bool m_shouldSwitchMethod(double method_switch_threshold) const {
+        // Give a temporally coherent method a chance to demonstrate reuse.
+        // Two full rebuilds also release this guard: reuse may be ineffective.
+        if ((factorization_times_for_method[current_method].incrementalReuseLimit > 0) && (m_analysesSinceSwitch < 2))
+            return false;
+
         if (totalSymbolicFactorizations() < warmup_sym_count) {
             if (current_method != 0)
                 std::cout << "WARNING: alternate method used during warmup period--this shouldn't happen!\n";

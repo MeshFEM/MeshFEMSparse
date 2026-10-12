@@ -109,7 +109,7 @@ void benchmark_method(double retain_pct, const std::string &method, const std::s
                 needsFactorization = true;
             }
             else {
-                needsFactorization = sparsityCache->update(*Hsp);
+                needsFactorization = bool(sparsityCache->update(*Hsp));
             }
 
             // needsFactorization = true;

@@ -67,7 +67,8 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::CholmodNesdis;
                 else if (provider == CholeskyProvider::CatamariNesdisParallel || provider == CholeskyProvider::CatamariNesdisReuse) {
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::CholmodNesdisParallel;
-                    if (provider == CholeskyProvider::CatamariNesdisReuse) c->setTemporalReusePeriod(32);
+                    if (provider == CholeskyProvider::CatamariNesdisReuse)
+                        c->setTemporalReusePeriod(64);
                 }
                 else if (provider == CholeskyProvider::CatamariMetis)
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::Metis;
@@ -75,8 +76,10 @@ std::unique_ptr<CholeskyFactorizerBase> make_cholesky_factorizer(CholeskyProvide
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::AMD;
                 else if (provider == CholeskyProvider::CatamariScotch)
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::Scotch;
-                else if (provider == CholeskyProvider::CatamariAdaptive)
+                else if (provider == CholeskyProvider::CatamariAdaptive) {
                     c->orderingMethod = CatamariFactorizer::OrderingMethod::Adaptive;
+                    c->setTemporalReusePeriod(64); // Also use *incremental* nesdis within adaptive ordering selection (initially matching CatamariNesdisReuse)
+                }
                 return c;
             }
 #endif

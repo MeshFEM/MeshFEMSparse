@@ -1,10 +1,12 @@
 add_executable(MeshFEMSparse_unit_tests
     main.cc
+    test_adaptive_ordering_selection.cc
     test_nd_ordering.cc
     test_element_partition.cc
     test_partitioned_gradient.cc
     test_native_ordering.cc
     test_sparse_matrices.cc
+    test_sparsity_lru.cc
     test_block_csc_hessian.cc
     test_accelerate_factorizer.cc
     test_catamari_solve_kernels.cc

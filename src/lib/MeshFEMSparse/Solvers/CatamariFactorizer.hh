@@ -102,8 +102,7 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
     // changes reset automatically; explicitly reset after other relabelings.
     void setTemporalReusePeriod(size_t period) { m_cholmodOrdering.setTemporalReusePeriod(period); }
     size_t temporalReusePeriod() const { return m_cholmodOrdering.temporalReusePeriod(); }
-    void resetTemporalReuse() { m_cholmodOrdering.resetTemporalReuse(); }
-    void resetSymbolicFactorizationReuse() override { resetTemporalReuse(); }
+    void resetAnalysisPhaseTemporalCache() override { m_cholmodOrdering.resetTemporalReuse(); }
 #if MESHFEM_WITH_CHOLMOD
     const CholmodParallelNesdis::TemporalReuseStatistics &temporalReuseStatistics() const {
         return m_cholmodOrdering.temporalReuseStatistics();
@@ -182,7 +181,9 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
         // Since AMD's symbolic factorization speedup sometimes exceeds even 10x, we use 0.1 as its "optimistic" symbolic time multiplier.
         // On the other hand, on challenging high-resolution problems, nnested dissection somtimes yields a numeric factorization that is twice as fast (or even more),
         inline static constexpr std::array<double, 2> optimistic_num_time_multiplier_estimates {{0.5, 1.35}};
-        inline static constexpr std::array<double, 2> optimistic_sym_time_multiplier_estimates {{5.0, 0.10}};
+        // inline static constexpr std::array<double, 2> optimistic_sym_time_multiplier_estimates {{5.0, 0.10}};
+        // Adjusted for `CholmodParallelNesdis` (which parallelizes and exploits temporal coherence)
+        inline static constexpr std::array<double, 2> optimistic_sym_time_multiplier_estimates {{1.5, 0.50}};
     };
 
     mutable AdaptiveOrderingSelection<OrderingChoices> adaptiveOrdering; // mutable so that solve timings can be recorded
@@ -257,6 +258,9 @@ private:
 
     CholmodOrdering m_cholmodOrdering;
     size_t m_blockSize = 1;
+
+    // Detect pin/blocksize changes that invalidate temporal caches
+    // of the analysis phase.
     size_t m_temporalBlockSize = 0;
     void m_prepareTemporalReuse(const std::vector<size_t> &pinnedVars) {
         if (!temporalReusePeriod()) return;
@@ -264,7 +268,7 @@ private:
         std::sort(sortedPins.begin(), sortedPins.end());
         sortedPins.erase(std::unique(sortedPins.begin(), sortedPins.end()), sortedPins.end());
         if (m_temporalBlockSize != m_blockSize || sortedPins != m_fixedVars)
-            resetTemporalReuse();
+            resetAnalysisPhaseTemporalCache();
         m_temporalBlockSize = m_blockSize;
     }
     size_t m_useBlockAccel = true;
