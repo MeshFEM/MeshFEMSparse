@@ -98,6 +98,14 @@ target_link_libraries(MeshFEMSparse
         warnings::all
 )
 
+if(APPLE)
+    find_library(MESHFEMSPARSE_ACCELERATE_FRAMEWORK NAMES Accelerate)
+    if(NOT MESHFEMSPARSE_ACCELERATE_FRAMEWORK)
+        message(FATAL_ERROR "The Accelerate framework is required on Apple platforms")
+    endif()
+    target_link_libraries(MeshFEMSparse PUBLIC ${MESHFEMSPARSE_ACCELERATE_FRAMEWORK})
+endif()
+
 meshfem_apply_abi_flags(MeshFEMSparse)
 
 if(MESHFEM_NO_GPL)
