@@ -51,6 +51,14 @@ public:
 #endif
     }
     int temporalReusePromotionDepth() const { return m_temporalReusePromotionDepth; }
+    void setUseCAMDRepair(bool enabled) {
+        if (m_useCAMDRepair != enabled) resetTemporalReuse();
+        m_useCAMDRepair = enabled;
+#if MESHFEM_WITH_CHOLMOD
+        m_reuseLong.use_camd_repair = m_reuseInt.use_camd_repair = enabled;
+#endif
+    }
+    bool useCAMDRepair() const { return m_useCAMDRepair; }
     void resetTemporalReuse() {
 #if MESHFEM_WITH_CHOLMOD
         m_reuseLong.reset();
@@ -110,6 +118,7 @@ private:
     bool m_ndCompress = true;
     size_t m_temporalReusePeriod = 0;
     int m_temporalReusePromotionDepth = 0;
+    bool m_useCAMDRepair = false;
 #if MESHFEM_WITH_CHOLMOD
     std::unique_ptr<cholmod_common> m_c, m_c_int;
     CholmodParallelNesdis::TemporalReuseState<int64_t> m_reuseLong;

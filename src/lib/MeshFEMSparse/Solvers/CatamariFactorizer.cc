@@ -45,7 +45,7 @@ struct CatamariFactorizer::State {
     std::vector<size_t> stashPins;
     FactorizationType stashType = FactorizationType::None;
     std::unique_ptr<catamari::SparseLDLControl<Field>> control = std::make_unique<catamari::SparseLDLControl<Field>>();
-    std::unique_ptr<CatamariConverterT<Field>> converter;
+    std::unique_ptr<CatamariPatternConverter> converter;
     Eigen::Matrix<Field, Eigen::Dynamic, 1> values, shiftValues;
     Eigen::Matrix<Field, Eigen::Dynamic, Eigen::Dynamic> rhs;
 
@@ -295,23 +295,24 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
     m_permutedReducedRowForRow.clear(); // The upcoming symbolic factorization will change any existing permutation...
 
     BENCHMARK_SCOPED_TIMER_SECTION timer("Catamari Symbolic Factorize");
-    // Note: passing `block_size = 1` below prevents the converter from
-    // expanding entries in the (block) sparsity pattern into
-    // `block_size` x `block_size` blocks of scalars in the block case.
+    // Note: the pattern-only converter below does not expand entries in the
+    // (block) sparsity pattern into `block_size` x `block_size` blocks of scalars
+    // in the block case.
     // (I.e., we leave the pattern in its compressed form.)
     if (state.converter) {
         BENCHMARK_SCOPED_TIMER_SECTION t2("CatamariConverter_reset");
         state.converter.reset();
     }
-    CSCMatrix<SuiteSparse_long, SuiteSparse_long> fullPattern;
-    const bool retainFullPattern = orderingMethod == OrderingMethod::CholmodNesdisParallel ||
-                                   orderingMethod == OrderingMethod::Adaptive;
-    state.converter = std::make_unique<CatamariConverterT<Field>>(*A_reduced, /* block_size = */ 1, m_legacy, m_entryForReducedEntry,
-                                                               retainFullPattern ? &fullPattern : nullptr);
+    state.converter = std::make_unique<CatamariPatternConverter>(*A_reduced);
+    const auto &fullPattern = state.converter->fullPattern();
 
     state.control->supernodal_control.relaxation_control.block_size = m_blockSize;
 
     using catamari::Int;
+
+    // Keep the previous scalar allocation out of the temporary block factor.
+    catamari::Buffer<Field> scalar_factor_values;
+    auto *deferred_values = m_blockSize > 1 ? &scalar_factor_values : nullptr;
 
     state.nativeOrdering = orderingMethod == OrderingMethod::Native;
     if (state.nativeOrdering) {
@@ -324,10 +325,10 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
         // can continue to bypass permutations.
         auto control = *state.control;
         control.supernodal_control.relaxation_control.preserve_ordering = true;
-        state.ldl->Factor(state.converter->get(), ordering, control, /* symbolic_only = */ true);
+        state.ldl->AnalyzePattern(state.converter->get(), ordering, control, deferred_values);
     }
     else if (orderingMethod == OrderingMethod::Catamari)
-        state.ldl->Factor(state.converter->get(), *state.control, /* symbolic_only = */ true);
+        state.ldl->AnalyzePattern(state.converter->get(), *state.control, deferred_values);
     else if ((orderingMethod == OrderingMethod::CholmodNesdis) || (orderingMethod == OrderingMethod::CholmodNesdisParallel)
           || (orderingMethod == OrderingMethod::Metis)
           || (orderingMethod == OrderingMethod::AMD) || (orderingMethod == OrderingMethod::Adaptive)) {
@@ -395,7 +396,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
                     catamari::Int nz = A.NumEntries();
                     Ai.resize(nz);
                     for (catamari::Int ii = 0; ii < nz; ++ii)
-                        Ai[ii] = A.Entry(ii).column; // Catamari matrix is transposed!
+                        Ai[ii] = A.ColumnIndex(ii); // Catamari matrix is transposed!
 
                     std::cout << "amd_valid: " << amd_valid(n, n, Ap.data(), Ai.data()) << std::endl;
                 }
@@ -428,7 +429,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
                         Pe[j] = col_start - j; // diagonal is excluded
                         ordering_index_type back = Pe[j];
                         for (ordering_index_type ii = col_start; ii < col_end; ++ii) {
-                            ordering_index_type i = A.Entry(ii).column; // Catamari matrix is transposed!
+                            ordering_index_type i = A.ColumnIndex(ii); // Catamari matrix is transposed!
                             if (i != j) Iw[back++] = i;
                         }
                     }
@@ -561,8 +562,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
             else throw std::runtime_error("Unknown orderingMethod");
 
         }
-        fullPattern = {}; // Ordering is finished; release the temporary CSC indices.
-        state.ldl->Factor(state.converter->get(), ordering, *state.control, /* symbolic_only = */ true);
+        state.ldl->AnalyzePattern(state.converter->get(), ordering, *state.control, deferred_values);
 
         double sym_fact_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - sym_fact_start).count();
         m_factorizationType = FactorizationType::Symbolic; // Note: this is needed here for the paranoid assertions in `getFlopEstimate()` and `getFactorNNZ()`
@@ -586,7 +586,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
         for (int i = 0; i < A_reduced->m; ++i)
             ordering.permutation[i] = perm[i]; // Accelerate's permutation convention is the same as ours
         quotient::InvertPermutation(ordering.permutation, &ordering.inverse_permutation);
-        state.ldl->Factor(state.converter->get(), ordering, *state.control, /* symbolic_only = */ true);
+        state.ldl->AnalyzePattern(state.converter->get(), ordering, *state.control, deferred_values);
     }
     else if ((orderingMethod == OrderingMethod::PardisoMetis) || (orderingMethod == OrderingMethod::PardisoParallelMetis)) {
 #if MESHFEM_WITH_PARDISO || MESHFEM_WITH_MKL_PARDISO
@@ -597,7 +597,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
         for (int i = 0; i < A_reduced->m; ++i)
             ordering.inverse_permutation[i] = perm[i]; // Pardiso's permutation convention is the inverse of ours
         quotient::InvertPermutation(ordering.inverse_permutation, &ordering.permutation);
-        state.ldl->Factor(state.converter->get(), ordering, *state.control, /* symbolic_only = */ true);
+        state.ldl->AnalyzePattern(state.converter->get(), ordering, *state.control, deferred_values);
 #else
         throw std::runtime_error("Pardiso ordering support not compiled in");
 #endif
@@ -615,7 +615,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
 
         scotch_ordering(*A_reduced, perm, iperm, scotchSettings.stratFlag, scotchSettings.imbalanceRatio);
 
-        state.ldl->Factor(state.converter->get(), ordering, *state.control, /* symbolic_only = */ true);
+        state.ldl->AnalyzePattern(state.converter->get(), ordering, *state.control, deferred_values);
         double sym_fact_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - sym_fact_start).count();
         // std::cout << "sym_fact_duration: " << sym_fact_duration << " seconds" << "\tH nnz: " << A_reduced->nz << "\tL nnz: " << getFactorNNZ() << "\tflop count: " << getFlopEstimate() << std::endl;
 #else
@@ -628,7 +628,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
     if (m_blockSize > 1) {
         // Scale dense dimensions and permutations while retaining compact row indices.
         ldl_block = std::move(state.ldl);
-        state.ldl = ldl_block->ExpandSymbolicFactorizationToScalar(m_blockSize);
+        state.ldl = ldl_block->ExpandSymbolicFactorizationToScalar(m_blockSize, &scalar_factor_values);
         state.ldl->elimination_workspace = std::move(ldl_block->elimination_workspace);
     }
 
@@ -666,8 +666,12 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
 
         {
             BENCHMARK_SCOPED_TIMER_SECTION t("Cleanup");
-            ldl_block.reset();
-            state.converter->freeCatamariMatrix();
+            {
+                // BENCHMARK_SCOPED_TIMER_SECTION block_reset_timer("Block factor reset");
+                if (ldl_block) catamari::supernodal_ldl::Factorization<Field>::ResetWithTiming(ldl_block->supernodal_factorization);
+                ldl_block.reset();
+            }
+            state.converter->freePattern();
         }
     }
     m_factorizationType = FactorizationType::Symbolic;

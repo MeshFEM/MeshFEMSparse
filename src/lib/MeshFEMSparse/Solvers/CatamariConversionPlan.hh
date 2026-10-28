@@ -33,8 +33,8 @@ using Int = catamari::Int;
 //          account for possible value array permutation caused by the original
 //          matrix begin evaluated in a block format with different storage
 //          layout (e.g., the `ContiguousBlocks` case of `BlockCSCHessian`).
-template<class Field>
-ConversionPlan constructConversionPlan(const catamari::CoordinateMatrix<Field> &A_rowcolreduced_full, const catamari::SparseLDL<Field> &ldl, const std::vector<SuiteSparse_long> &srcReducedEntryForFullMatrixEntry, const std::vector<SuiteSparse_long> &entryForReducedEntry, const VecX_T<SuiteSparse_long> &dataOffsetForScalarHessianLoc) {
+template<class Field, class Matrix>
+ConversionPlan constructConversionPlan(const Matrix &A_rowcolreduced_full, const catamari::SparseLDL<Field> &ldl, const std::vector<SuiteSparse_long> &srcReducedEntryForFullMatrixEntry, const std::vector<SuiteSparse_long> &entryForReducedEntry, const VecX_T<SuiteSparse_long> &dataOffsetForScalarHessianLoc) {
     BENCHMARK_SCOPED_TIMER_SECTION ctimer("constructConversionPlan");
     auto f = ldl.supernodal_factorization.get();
     if (f == nullptr) throw std::runtime_error("Only supernodal factorizations are supported");
@@ -65,7 +65,7 @@ ConversionPlan constructConversionPlan(const catamari::CoordinateMatrix<Field> &
                 const Int col_entries_end = A_rowcolreduced_full.RowEntryOffset(j_orig + 1);
                 Int colSize = 0;
                 for (Int ii = A_rowcolreduced_full.RowEntryOffset(j_orig); ii < col_entries_end; ++ii)
-                    if (o.permutation[A_rowcolreduced_full.Entry(ii).column] >= j_perm) ++colSize; // entry in lower triangle?
+                    if (o.permutation[A_rowcolreduced_full.ColumnIndex(ii)] >= j_perm) ++colSize; // entry in lower triangle?
                 columnSizes[j_perm] = colSize;
             }
         }
@@ -106,13 +106,13 @@ ConversionPlan constructConversionPlan(const catamari::CoordinateMatrix<Field> &
                 Int j_orig = o.inverse_permutation[j_perm];
                 Int columnBack = columnBacks[j_perm];
 
-                // Note: catamari::CoordinateMatrix is row major, hence the implicit transpose happening here...
+                // Note: the pattern view is row major, hence the implicit transpose happening here...
                 const Int col_entries_begin = A_rowcolreduced_full.RowEntryOffset(j_orig);
                 const Int col_entries_end   = A_rowcolreduced_full.RowEntryOffset(j_orig + 1);
                 const Int *guess = nullptr;
                 for (Int ii = col_entries_begin; ii < col_entries_end; ++ii) {
-                    const catamari::MatrixEntry<Field> &e = A_rowcolreduced_full.Entry(ii);
-                    Int i_perm = o.permutation[e.column];
+                    const Int entry_column = A_rowcolreduced_full.ColumnIndex(ii);
+                    Int i_perm = o.permutation[entry_column];
                     if (i_perm < j_perm) continue; // Skip the strict upper triangle.
 
                     // Locate (i_perm, j_perm) in the supernode structure.
@@ -169,8 +169,8 @@ ConversionPlan constructConversionPlan(const catamari::CoordinateMatrix<Field> &
 // to the corresponding nonzero entry the pre-row-col-reduced block matrix.
 //
 // TODO: try to simplify this... :(
-template<class Field>
-ConversionPlan constructScalarConversionPlan(const catamari::CoordinateMatrix<Field> &A_rowcolreduced_full_block,
+template<class Field, class Matrix>
+ConversionPlan constructScalarConversionPlan(const Matrix &A_rowcolreduced_full_block,
                    const SuiteSparseMatrix &A_nonreduced_block,
                    const std::vector<SuiteSparse_long> &reducedRowForRow_block,
                    const catamari::Int block_size,
@@ -229,7 +229,7 @@ ConversionPlan constructScalarConversionPlan(const catamari::CoordinateMatrix<Fi
                     const Int col_entries_end = A_rowcolreduced_full_block.RowEntryOffset(j_orig + 1);
                     Int colSize = 0;
                     for (Int ii = A_rowcolreduced_full_block.RowEntryOffset(j_orig); ii < col_entries_end; ++ii)
-                        if (o.permutation[A_rowcolreduced_full_block.Entry(ii).column] >= j_perm) ++colSize; // entry in lower triangle?
+                        if (o.permutation[A_rowcolreduced_full_block.ColumnIndex(ii)] >= j_perm) ++colSize; // entry in lower triangle?
 
                     Int scalarColSize = block_size * colSize;
                     for (Int c = 0; c < block_size; ++c)
@@ -274,13 +274,12 @@ ConversionPlan constructScalarConversionPlan(const catamari::CoordinateMatrix<Fi
             for (Int j_perm = supernode_start; j_perm < supernode_end; ++j_perm) {
                 const Int j_orig = o.inverse_permutation[j_perm];
 
-                // Note: catamari::CoordinateMatrix is row major, hence the implicit transpose happening here...
+                // Note: the pattern view is row major, hence the implicit transpose happening here...
                 const Int col_entries_begin = A_rowcolreduced_full_block.RowEntryOffset(j_orig);
                 const Int col_entries_end   = A_rowcolreduced_full_block.RowEntryOffset(j_orig + 1);
                 const Int *guess = nullptr;
                 for (Int ii = col_entries_begin; ii < col_entries_end; ++ii) {
-                    const catamari::MatrixEntry<Field> &e = A_rowcolreduced_full_block.Entry(ii);
-                    const Int i_orig = e.column;
+                    const Int i_orig = A_rowcolreduced_full_block.ColumnIndex(ii);
                     Int i_perm = o.permutation[i_orig];
                     if (i_perm < j_perm) continue; // Skip the strict upper triangle.
 
@@ -399,8 +398,8 @@ ConversionPlan constructScalarConversionPlan(const catamari::CoordinateMatrix<Fi
 // Currently the plan is for injecting entries into the expanded factorization
 // `ldl_scalar`, but we intend eventually to avoid the expansion step and
 // work directly with `ldl_block`.
-template<class Field>
-ConversionPlan constructBlockConversionPlan(const catamari::CoordinateMatrix<Field> &A_rowcolreduced_full_block, catamari::Int block_size,
+template<class Field, class Matrix>
+ConversionPlan constructBlockConversionPlan(const Matrix &A_rowcolreduced_full_block, catamari::Int block_size,
                                             const catamari::SparseLDL<Field> &ldl_scalar, const catamari::SparseLDL<Field> &ldl_block,
                                             const std::vector<SuiteSparse_long> &srcReducedEntryForFullMatrixEntry_block,
                                             const std::vector<SuiteSparse_long> &entryForReducedEntry_block) {
@@ -441,7 +440,7 @@ ConversionPlan constructBlockConversionPlan(const catamari::CoordinateMatrix<Fie
                 const Int col_entries_end = A_rowcolreduced_full_block.RowEntryOffset(j_orig + 1);
                 Int colSizeLowerTriSrc = 0, colSizeUpperTriSrc = 0;
                 for (Int ii = A_rowcolreduced_full_block.RowEntryOffset(j_orig); ii < col_entries_end; ++ii) {
-                    Int i_orig = A_rowcolreduced_full_block.Entry(ii).column;
+                    Int i_orig = A_rowcolreduced_full_block.ColumnIndex(ii);
                     if (o.permutation[i_orig] < j_perm) continue; // Skip blocks permuting outside the L factor.
                     if (i_orig >= j_orig) ++colSizeLowerTriSrc;   // Block sourced from lower triangle of A (needs transpose)
                     else                  ++colSizeUpperTriSrc;   // Block sourced from strict upper triangle (no transpose)
@@ -493,11 +492,11 @@ ConversionPlan constructBlockConversionPlan(const catamari::CoordinateMatrix<Fie
             for (Int j_perm = supernode_start; j_perm < supernode_end; ++j_perm) {
                 const Int j_orig = o.inverse_permutation[j_perm];
 
-                // Note: catamari::CoordinateMatrix is row major, hence the implicit transpose happening here...
+                // Note: the pattern view is row major, hence the implicit transpose happening here...
                 const Int col_entries_begin = A_rowcolreduced_full_block.RowEntryOffset(j_orig);
                 const Int col_entries_end   = A_rowcolreduced_full_block.RowEntryOffset(j_orig + 1);
                 for (Int ii = col_entries_begin; ii < col_entries_end; ++ii) {
-                    const Int i_orig = A_rowcolreduced_full_block.Entry(ii).column;
+                    const Int i_orig = A_rowcolreduced_full_block.ColumnIndex(ii);
                     Int i_perm = o.permutation[i_orig];
                     if (i_perm < j_perm) continue; // Skip the strict upper triangle.
 

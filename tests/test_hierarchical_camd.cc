@@ -847,6 +847,7 @@ TEMPLATE_TEST_CASE("temporal ND repairs induced subgraphs and reruns CAMD", "[te
     common.value.method[0].nd_compress = GENERATE(0, 1);
     common.value.method[0].prune_dense = -1;
     TemporalReuseState<Int> reuse;
+    reuse.use_camd_repair = GENERATE(false, true);
     reuse.temporal_reuse_period = 8;
     auto edges = test_temporal_edges<Int>();
     Graph<Int> initial(30, edges);
@@ -862,6 +863,7 @@ TEMPLATE_TEST_CASE("temporal ND repairs induced subgraphs and reruns CAMD", "[te
     // Seed a known valid forest to make exact repair regions independent of
     // METIS version/partition choices. Subsequent repairs use the real ND path.
     reuse.tree = test_temporal_tree<Int>();
+    if (reuse.use_camd_repair) std::iota(reuse.permutation.begin(), reuse.permutation.end(), Int(0));
     auto before = reuse.tree;
     size_t subtrees = 0, vertices = 0;
     bool full = false;
@@ -881,6 +883,7 @@ TEMPLATE_TEST_CASE("temporal ND repairs induced subgraphs and reruns CAMD", "[te
     REQUIRE(reuse.statistics.full_rebuild == full);
     REQUIRE(reuse.statistics.recomputed_subtrees == subtrees);
     REQUIRE(reuse.statistics.repartitioned_vertices == vertices);
+    REQUIRE(reuse.statistics.camd_repaired == (reuse.use_camd_repair && !full && subtrees == 0));
     REQUIRE(reuse.incremental_analyses_since_rebuild == (full ? 0 : 1));
     REQUIRE(reuse.statistics.nd_seconds >= 0);
     if (!full) {
@@ -1019,28 +1022,253 @@ TEMPLATE_TEST_CASE("temporal ND promotion rebuilds only affected vertex lists", 
         REQUIRE(tree.nodes[c].separator_vertices == expected[c]);
 }
 
-TEMPLATE_TEST_CASE("temporal ND promotion leaves unsupported moves to rebuilding", "[temporal_nd][promotion]", int32_t, int64_t) {
+TEMPLATE_TEST_CASE("temporal ND promotion retains empty separators for later reuse", "[temporal_nd][promotion]", int32_t, int64_t) {
     using Int = TestType;
-    PersistentSeparatorTree<Int> tree;
+    const Int parent[]{2, 2, 4, 4, 6, 6, -1};
+    const Int member[]{0, 0, 1, 1, 2, 3, 3, 4, 5, 5, 6};
+    auto tree = PersistentSeparatorTree<Int>::from_cholmod(11, 7, parent, member);
+    // Empty two consecutive internal separators, retaining all their children.
+    Graph<Int> graph(11, {{4, 8}, {7, 9}});
+    REQUIRE(tree.promote_violations(graph.p.data(), graph.i.data(), -1) == 2);
+    REQUIRE(tree.nodes[2].separator_vertices.empty());
+    REQUIRE(tree.nodes[4].separator_vertices.empty());
+    REQUIRE(tree.nodes[2].alive);
+    REQUIRE(tree.nodes[4].alive);
+    REQUIRE(tree.nodes[2].children == std::vector<Int>{0, 1});
+    REQUIRE(tree.nodes[4].children == std::vector<Int>{2, 3});
+    std::vector<Int> flat_parent(11, -2), flat_member(11);
+    REQUIRE(tree.flatten(flat_parent.data(), flat_member.data()) == 5);
+    REQUIRE(std::vector<Int>(flat_parent.begin(), flat_parent.begin() + 5) == std::vector<Int>{4, 4, 4, 4, -1});
+    REQUIRE(flat_parent[5] == -2);
+    REQUIRE_FALSE(tree.dirty_subtrees(graph.p.data(), graph.i.data()).full_rebuild);
+    REQUIRE(tree.dirty_subtrees(graph.p.data(), graph.i.data()).roots.empty());
+
+    // An empty LCA can acquire vertices again without changing any node IDs.
+    Graph<Int> changed(11, {{4, 8}, {7, 9}, {0, 2}});
+    REQUIRE(tree.promote_violations(changed.p.data(), changed.i.data(), -1) == 1);
+    REQUIRE(tree.member[0] == 2);
+    REQUIRE(tree.nodes[2].separator_vertices == std::vector<Int>{0});
+    REQUIRE(tree.flatten(flat_parent.data(), flat_member.data()) == 6);
+    REQUIRE(tree.dirty_subtrees(changed.p.data(), changed.i.data()).roots.empty());
+}
+
+TEMPLATE_TEST_CASE("temporal ND promotion joins only affected roots", "[temporal_nd][promotion]", int32_t, int64_t) {
+    using Int = TestType;
+    const int cutoff = GENERATE(1, -1);
+    const Int parent[]{-1, -1, -1, -1}, member[]{0, 0, 1, 1, 2, 2, 3, 3};
+    auto tree = PersistentSeparatorTree<Int>::from_cholmod(8, 4, parent, member);
+    Graph<Int> graph(8, {{0, 2}, {1, 3}});
+    REQUIRE(tree.promote_violations(graph.p.data(), graph.i.data(), cutoff) == 2);
+    REQUIRE(tree.roots == std::vector<Int>{4, 2, 3});
+    REQUIRE(tree.nodes[4].children == std::vector<Int>{0, 1});
+    REQUIRE(tree.nodes[0].separator_vertices.empty());
+    REQUIRE(tree.nodes[4].separator_vertices == std::vector<Int>{0, 1});
+    REQUIRE(tree.nodes[2].parent == -1);
+    REQUIRE(tree.nodes[3].parent == -1);
+    REQUIRE(tree.depth == std::vector<Int>{1, 1, 0, 0, 0});
+    REQUIRE(tree.dirty_subtrees(graph.p.data(), graph.i.data()).roots.empty());
+
+    SECTION("another disjoint join") {
+        Graph<Int> changed(8, {{0, 2}, {1, 3}, {4, 6}});
+        REQUIRE(tree.promote_violations(changed.p.data(), changed.i.data(), cutoff) == 1);
+        REQUIRE(tree.roots == std::vector<Int>{4, 5});
+        REQUIRE(tree.nodes[5].children == std::vector<Int>{2, 3});
+    }
+    SECTION("join a previously joined tree") {
+        Graph<Int> changed(8, {{0, 2}, {1, 3}, {0, 4}});
+        REQUIRE(tree.promote_violations(changed.p.data(), changed.i.data(), cutoff) == 1);
+        REQUIRE(tree.roots == std::vector<Int>{5, 3});
+        REQUIRE(tree.nodes[5].children == std::vector<Int>{4, 2});
+        REQUIRE(tree.depth[1] == 2);
+        REQUIRE(tree.depth[3] == 0);
+    }
+}
+
+TEMPLATE_TEST_CASE("temporal ND repairs below empty separators", "[temporal_nd][promotion]", int32_t, int64_t) {
+    using Int = TestType;
+    const int cutoff = GENERATE(1, -1);
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    Environment verify("CHOLMOD_NESDIS_CAMD_VERIFY", "1");
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 8;
+    reuse.promotion_depth = cutoff;
+    std::vector<Int> parent(11), member(11), perm(11);
+    auto order = [&](const Graph<Int> &graph) {
+        auto nc = nested_dissection_from_graph<Int>(graph.view, perm.data(), parent.data(), member.data(), &common.value, &reuse);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        check_separator_forest(graph, Int(nc), parent, member, perm);
+    };
+    Graph<Int> initial(11, {});
+    order(initial);
+    const Int seed_parent[]{2, 2, 4, 4, 6, 6, -1}, seed_member[]{0, 0, 1, 1, 2, 3, 3, 4, 5, 5, 6};
+    reuse.tree = PersistentSeparatorTree<Int>::from_cholmod(11, 7, seed_parent, seed_member);
+    Graph<Int> emptied(11, {{4, 8}, {7, 9}});
+    order(emptied);
+    REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    REQUIRE(reuse.statistics.promoted_vertices == 2);
+    REQUIRE(reuse.tree.nodes[2].separator_vertices.empty());
+    REQUIRE(reuse.tree.nodes[4].separator_vertices.empty());
+    Graph<Int> changed(11, {{4, 8}, {7, 9}, {0, 2}});
+    order(changed);
+    REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    REQUIRE(reuse.statistics.repartitioned_vertices == size_t(cutoff == 1 ? 4 : 0));
+    REQUIRE(reuse.statistics.recomputed_subtrees == size_t(cutoff == 1 ? 1 : 0));
+    REQUIRE(reuse.statistics.promoted_vertices == size_t(cutoff == 1 ? 0 : 1));
+    order(changed);
+    REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    REQUIRE(reuse.statistics.repartitioned_vertices == 0);
+    REQUIRE(reuse.statistics.promoted_vertices == 0);
+}
+
+TEMPLATE_TEST_CASE("temporal ND promotion uses depths before root joins", "[temporal_nd][promotion]", int32_t, int64_t) {
+    using Int = TestType;
+    const Int parent[]{2, 2, -1, -1}, member[]{3, 0, 0, 1, 1, 2, 2};
+    auto tree = PersistentSeparatorTree<Int>::from_cholmod(7, 4, parent, member);
+    Graph<Int> graph(7, {{0, 1}, {2, 3}});
+    REQUIRE(tree.promote_violations(graph.p.data(), graph.i.data(), 1) == 2);
+    REQUIRE(tree.member[0] == 4);
+    REQUIRE(tree.member[2] == 2); // Eligible before the first edge moved root 2 to depth 1.
+    REQUIRE(tree.depth[2] == 1);
+    REQUIRE(tree.dirty_subtrees(graph.p.data(), graph.i.data()).roots.empty());
+}
+
+TEMPLATE_TEST_CASE("temporal ND parallel promotion preserves graph traversal order", "[temporal_nd][promotion]", int32_t, int64_t) {
+    using Int = TestType;
+    const int cutoff = GENERATE(1, 3, -1);
+    const bool unsorted = GENERATE(false, true);
+    const auto base = test_temporal_tree<Int>();
+    const Int n = 30 * 256;
+    std::vector<Int> parent(15), member(n);
+    for (Int c = 0; c < 15; ++c) parent[c] = base.nodes[c].parent;
+    for (Int v = 0; v < n; ++v) member[v] = (v % 30) / 2;
     std::vector<std::pair<Int, Int>> edges;
-    SECTION("would empty an existing node") {
-        const Int parent[]{2, 2, -1}, member[]{0, 1, 2};
-        tree = PersistentSeparatorTree<Int>::from_cholmod(3, 3, parent, member);
-        edges = {{0, 1}};
+    for (Int v = 0; v < n; v += 30) {
+        for (auto [a, b] : test_temporal_edges<Int>()) edges.emplace_back(v + a, v + b);
+        for (auto [a, b] : std::vector<std::pair<Int, Int>>{{0, 2}, {1, 3}, {0, 6}, {0, 14}})
+            edges.emplace_back(v + a, v + b);
+        edges.emplace_back(0, v + 16); // Shared endpoint and many violations in one column.
     }
-    SECTION("would join forest roots") {
-        const Int parent[]{-1, -1}, member[]{0, 0, 1, 1};
-        tree = PersistentSeparatorTree<Int>::from_cholmod(4, 2, parent, member);
-        edges = {{0, 2}};
+    Graph<Int> graph(n, edges);
+    if (unsorted)
+        for (Int v = 0; v < n; ++v) std::reverse(graph.i.begin() + graph.p[v], graph.i.begin() + graph.p[v + 1]);
+    const auto original = PersistentSeparatorTree<Int>::from_cholmod(n, 15, parent.data(), member.data());
+    auto reference = original;
+    size_t moved;
+    {
+        tbb::global_control control(tbb::global_control::max_allowed_parallelism, 1);
+        moved = reference.promote_violations(graph.p.data(), graph.i.data(), cutoff);
     }
-    const auto before = tree;
-    Graph<Int> graph(tree.member.size(), edges);
-    REQUIRE(tree.promote_violations(graph.p.data(), graph.i.data(), -1) == 0);
-    REQUIRE(tree.member == before.member);
-    REQUIRE(tree.roots == before.roots);
-    for (size_t c = 0; c < tree.nodes.size(); ++c)
-        REQUIRE(tree.nodes[c].separator_vertices == before.nodes[c].separator_vertices);
-    REQUIRE(tree.dirty_subtrees(graph.p.data(), graph.i.data()).full_rebuild);
+    REQUIRE(moved > 0);
+    for (size_t threads : {2, 4}) {
+        tbb::global_control control(tbb::global_control::max_allowed_parallelism, threads);
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            auto tree = original;
+            REQUIRE(tree.promote_violations(graph.p.data(), graph.i.data(), cutoff) == moved);
+            REQUIRE(tree.member == reference.member);
+            for (size_t c = 0; c < tree.nodes.size(); ++c)
+                REQUIRE(tree.nodes[c].separator_vertices == reference.nodes[c].separator_vertices);
+        }
+    }
+}
+
+TEMPLATE_TEST_CASE("temporal ND exports joined forests within the original output buffers", "[temporal_nd][promotion]", int32_t, int64_t) {
+    using Int = TestType;
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    Environment camd("CHOLMOD_NESDIS_CAMD_CUT_DEPTH", GENERATE("-1", "4"));
+    Environment verify("CHOLMOD_NESDIS_CAMD_VERIFY", "1");
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    common.value.method[0].nd_compress = GENERATE(0, 1);
+    common.value.method[0].nd_camd = GENERATE(0, 1, 2);
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 4;
+    reuse.promotion_depth = GENERATE(1, -1);
+    const Int n = 17;
+    std::vector<Int> perm(n), parent(n + 1, -2), member(n);
+    auto order = [&](const Graph<Int> &graph) {
+        auto nc = nested_dissection_from_graph<Int>(graph.view, perm.data(), parent.data(), member.data(), &common.value, &reuse);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        REQUIRE(nc <= n);
+        REQUIRE(parent[n] == -2);
+        check_separator_forest(graph, Int(nc), parent, member, perm);
+        return nc;
+    };
+    Graph<Int> initial(n, {});
+    order(initial);
+    std::fill(parent.begin(), parent.begin() + n, -1);
+    std::iota(member.begin(), member.end(), Int(0));
+    reuse.tree = PersistentSeparatorTree<Int>::from_cholmod(n, n, parent.data(), member.data());
+    std::vector<std::pair<Int, Int>> edges;
+    for (Int v = 1; v < n - 1; ++v) edges.emplace_back(0, v);
+    Graph<Int> joined(n, edges);
+    REQUIRE(order(joined) == n);
+    REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    REQUIRE(reuse.statistics.repartitioned_vertices == 0);
+    REQUIRE(reuse.statistics.promoted_vertices == 1);
+    REQUIRE(reuse.tree.nodes.size() == size_t(2 * n - 2));
+    REQUIRE(reuse.tree.roots == std::vector<Int>{2 * n - 3, n - 1});
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        REQUIRE(order(joined) == n);
+        REQUIRE_FALSE(reuse.statistics.full_rebuild);
+        REQUIRE(reuse.statistics.promoted_vertices == 0);
+    }
+    // Edge deletion retains the hierarchy; the configured periodic refresh still runs.
+    order(initial);
+    REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    order(initial);
+    REQUIRE(reuse.statistics.full_rebuild);
+}
+
+TEMPLATE_TEST_CASE("temporal CAMD repair preserves residents and appends promoted vertices", "[temporal_nd][camd_repair]", int32_t, int64_t) {
+    using Int = TestType;
+    Environment camd("CHOLMOD_NESDIS_CAMD_CUT_DEPTH", GENERATE("-1", "4"));
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 8;
+    reuse.promotion_depth = -1;
+    reuse.use_camd_repair = true;
+    auto edges = test_temporal_edges<Int>();
+    std::vector<Int> parent(30), member(30), perm(30);
+    auto order = [&] {
+        Graph<Int> graph(30, edges);
+        auto nc = nested_dissection_from_graph<Int>(graph.view, perm.data(), parent.data(), member.data(), &common.value, &reuse);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        check_separator_forest(graph, Int(nc), parent, member, perm);
+        return nc;
+    };
+    order();
+    // Give every separator a known, non-natural internal order.
+    reuse.tree = test_temporal_tree<Int>();
+    for (Int v = 0; v < 30; ++v) reuse.permutation[v] = v ^ 1;
+    const auto previous = reuse.permutation, old_member = reuse.tree.member;
+    edges.emplace_back(0, 2);
+    edges.emplace_back(0, 14);
+    const auto nc = order();
+    REQUIRE(reuse.statistics.camd_repaired);
+    REQUIRE(reuse.statistics.promoted_vertices > 0);
+    REQUIRE(common.value.lnz == -1);
+    REQUIRE(common.value.fl == -1);
+    // Each bucket must retain the old resident order followed by arrivals.
+    std::vector<Int> expected;
+    for (Int c = 0; c < nc; ++c) {
+        for (Int v : previous) if (member[v] == c && old_member[v] == reuse.tree.member[v]) expected.push_back(v);
+        for (Int v : previous) if (member[v] == c && old_member[v] != reuse.tree.member[v]) expected.push_back(v);
+    }
+    REQUIRE(perm == expected);
+    REQUIRE(reuse.permutation == perm);
+    const auto saved = perm;
+    { Environment invalid("CHOLMOD_NESDIS_NUM_THREADS", "invalid");
+      Graph<Int> graph(30, edges);
+      REQUIRE(nested_dissection_from_graph<Int>(graph.view, perm.data(), parent.data(), member.data(), &common.value, &reuse) < 0); }
+    REQUIRE(reuse.permutation == saved);
+    order();
+    REQUIRE(perm == saved);
+    REQUIRE(reuse.statistics.promoted_vertices == 0);
+    // Missing permutation history refreshes CAMD, retaining a valid ND tree.
+    reuse.permutation.clear();
+    order();
+    REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    REQUIRE_FALSE(reuse.statistics.camd_repaired);
 }
 
 TEMPLATE_TEST_CASE("temporal ND rebuild period and cache lifetime", "[temporal_nd]", int32_t, int64_t) {
@@ -1050,6 +1278,7 @@ TEMPLATE_TEST_CASE("temporal ND rebuild period and cache lifetime", "[temporal_n
     common.value.method[0].nd_small = 4;
     common.value.method[0].nd_components = 1;
     TemporalReuseState<Int> reuse;
+    reuse.use_camd_repair = GENERATE(false, true);
     reuse.temporal_reuse_period = 2;
     std::vector<Int> parent(30), member(30), perm(30);
     Graph<Int> graph(30, test_temporal_edges<Int>());
@@ -1064,6 +1293,7 @@ TEMPLATE_TEST_CASE("temporal ND rebuild period and cache lifetime", "[temporal_n
     for (size_t call = 1; call <= 2; ++call) {
         order(graph);
         REQUIRE_FALSE(reuse.statistics.full_rebuild);
+        REQUIRE(reuse.statistics.camd_repaired == reuse.use_camd_repair);
         REQUIRE(reuse.incremental_analyses_since_rebuild == call);
         REQUIRE(reuse.statistics.repartitioned_vertices == 0);
         REQUIRE(parent == initial_parent);
@@ -1073,11 +1303,21 @@ TEMPLATE_TEST_CASE("temporal ND rebuild period and cache lifetime", "[temporal_n
     order(graph);
     REQUIRE(reuse.statistics.full_rebuild);
     REQUIRE(reuse.incremental_analyses_since_rebuild == 0);
+    REQUIRE_FALSE(reuse.statistics.camd_repaired);
+    SECTION("CAMD settings change refreshes ordering only") {
+        common.value.method[0].aggressive ^= 1;
+        order(graph);
+        REQUIRE_FALSE(reuse.statistics.full_rebuild);
+        REQUIRE_FALSE(reuse.statistics.camd_repaired);
+        order(graph);
+        REQUIRE(reuse.statistics.camd_repaired == reuse.use_camd_repair);
+    }
     SECTION("dimension change") { Graph<Int> smaller(29, {}); order(smaller); REQUIRE(reuse.statistics.full_rebuild); }
     SECTION("empty graph clears history") {
         Graph<Int> empty(0, {});
         order(empty);
         REQUIRE(reuse.tree.nodes.empty());
+        REQUIRE(reuse.permutation.empty());
         order(graph);
         REQUIRE(reuse.statistics.full_rebuild);
     }
@@ -1159,6 +1399,77 @@ TEMPLATE_TEST_CASE("temporal ND matrix API preserves symmetric and AAT semantics
 }
 
 #if MESHFEM_WITH_CATAMARI && !MESHFEM_USE_LEGACY_CATAMARI
+TEMPLATE_TEST_CASE("Catamari promotion solves across component joins and empty separators", "[temporal_nd][promotion][catamari]", float, double) {
+    using Field = TestType;
+    using Int = int32_t;
+    Environment threads("CHOLMOD_NESDIS_NUM_THREADS", "4");
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    Common common(CHOLMOD_INT);
+    TemporalReuseState<Int> reuse;
+    reuse.use_camd_repair = GENERATE(false, true);
+    reuse.temporal_reuse_period = 8;
+    reuse.promotion_depth = -1;
+    const Int n = 32;
+    std::vector<Int> perm(n), parent(n), member(n);
+    catamari::SparseLDL<Field> factor;
+    catamari::SparseLDLControl<Field> control;
+    control.supernodal_strategy = catamari::kSupernodalFactorization;
+    for (int step = 0; step < 5; ++step) {
+        CAPTURE(step);
+        std::vector<std::pair<Int, Int>> edges;
+        if (step == 1 || step == 2)
+            for (Int v = 1; v < (step == 1 ? n / 2 : n); ++v) edges.emplace_back(0, v);
+        if (step == 4) edges.emplace_back(1, 2);
+        Graph<Int> graph(n, edges);
+        auto nc = nested_dissection_from_graph<Int>(graph.view, perm.data(), parent.data(), member.data(), &common.value, &reuse);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        check_separator_forest(graph, Int(nc), parent, member, perm);
+        REQUIRE(reuse.statistics.full_rebuild == (step == 0));
+        REQUIRE(reuse.statistics.camd_repaired == (reuse.use_camd_repair && step > 0));
+        if (step > 0) REQUIRE(reuse.statistics.repartitioned_vertices == 0);
+        if (step == 1 || step == 2 || step == 4) REQUIRE(reuse.statistics.promoted_vertices > 0);
+
+        catamari::SymmetricOrdering ordering;
+        ordering.permutation.Resize(n);
+        ordering.inverse_permutation.Resize(n);
+        ordering.supernode_sizes.Resize(nc, 0);
+        ordering.assembly_forest.parents.Resize(nc);
+        for (Int v = 0; v < n; ++v) {
+            ordering.inverse_permutation[v] = perm[v];
+            ordering.permutation[perm[v]] = v;
+            ++ordering.supernode_sizes[member[v]];
+        }
+        for (Int c = 0; c < nc; ++c) ordering.assembly_forest.parents[c] = parent[c];
+        catamari::OffsetScan(ordering.supernode_sizes, &ordering.supernode_offsets);
+        ordering.assembly_forest.FillFromParents();
+        catamari::CoordinateMatrix<Field> matrix;
+        matrix.Resize(n, n);
+        catamari::BlasMatrix<Field> rhs(n, 1);
+        auto expected = [](Int v) { return Field(v + 1) / n; };
+        for (Int v = 0; v < n; ++v) {
+            matrix.QueueEntryAddition(v, v, n + 1);
+            rhs(v) = (n + 1) * expected(v);
+        }
+        for (auto [a, b] : edges) {
+            matrix.QueueEntryAddition(a, b, -1);
+            matrix.QueueEntryAddition(b, a, -1);
+            rhs(a) -= expected(b);
+            rhs(b) -= expected(a);
+        }
+        matrix.FlushEntryQueues();
+        factor.Factor(matrix, ordering, control);
+        factor.Solve(&rhs.view, 1);
+        for (Int v = 0; v < n; ++v)
+            REQUIRE(std::abs(rhs(v) - expected(v)) < (std::is_same_v<Field, float> ? 1e-5 : 1e-11));
+        if (step == 0) {
+            // Seed singleton roots independently of CHOLMOD's grouping policy.
+            std::fill(parent.begin(), parent.end(), -1);
+            std::iota(member.begin(), member.end(), Int(0));
+            reuse.tree = PersistentSeparatorTree<Int>::from_cholmod(n, n, parent.data(), member.data());
+        }
+    }
+}
+
 TEST_CASE("Catamari temporal ND history survives symbolic analyses and resets for pin changes", "[temporal_nd][catamari]") {
     Environment threads("CHOLMOD_NESDIS_NUM_THREADS", "4");
     Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");

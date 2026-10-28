@@ -2,9 +2,11 @@
 #define MESHFEMSPARSE_PERSISTENT_SEPARATOR_TREE_HH
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -17,6 +19,8 @@ namespace MeshFEM::CholmodParallelNesdis {
 // Internal forest representation. IDs remain stable outside replaced subtrees;
 // tombstones are discarded at the next full rebuild. No synthetic components
 // are emitted for disconnected graphs or disconnected replacement subgraphs.
+// Empty separators retain their place in the hierarchy internally but are
+// omitted from CHOLMOD output.
 template<class Int>
 struct PersistentSeparatorTree {
     struct Node {
@@ -83,40 +87,79 @@ struct PersistentSeparatorTree {
     // disabling subtree ND calls.
     //
     // Return the number of distinct moved vertices.
+    // On successful repair, update `this->member` and `this->nodes[*].separator_vertices`.
     //
-    // Currently if the separator tree is actually a forest
+    // If the separator tree is actually a forest
     // (e.g., arising from two disconnected simulation bodies),
     // and if a new edge connects vertices belonging to different trees,
-    // a full rebuild is triggered. We will address this later by
-    // creating and then glomming into a new root node.
-    // We also currently give up and rebuild if any separator node is emptied.
+    // create a new root over the two affected trees and promote an endpoint into it.
+    // Eligibility uses depths at the start of this update, before any such joins.
+    // If a separator node is emptied, keep it available as an LCA internally;
+    // flatten() omits it from the exported forest.
     size_t promote_violations(const Int *p, const Int *i, int cutoff) {
         if (cutoff < -1) throw std::invalid_argument("invalid temporal reuse promotion depth");
         if (cutoff == 0) return 0;
         auto eligible = [&](Int r) { return cutoff < 0 || depth[r] < cutoff; };
         // Scan the full graph collecting edges that violate the separator tree
-        // at a depth that makes them elegible for promotion.
+        // at a depth that makes them eligible for promotion.
         std::vector<std::pair<Int, Int>> edges;
-        std::vector<size_t> counts(member.size(), 0);
-        for (size_t v = 0; v < member.size(); ++v) {
-            for (Int k = p[v]; k < p[v + 1]; ++k) {
-                Int u = i[k];
-                if (u >= Int(v)) continue;
-                Int a = member[v], b = member[u], r = lca(a, b);
-                if (r == a || r == b) continue;
-                if (r < 0) return 0;
-                if (eligible(r)) {
-                    edges.emplace_back(Int(v), u);
-                    ++counts[v]; ++counts[u];
+        std::mutex edges_mutex;
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, member.size(), 512), [&](const auto &range) {
+            // Only violations need synchronization. Batch them on the stack;
+            // no per-task heap allocation or full-graph temporary is needed.
+            std::array<std::pair<Int, Int>, 64> pending;
+            size_t count = 0;
+            auto flush = [&] {
+                std::lock_guard<std::mutex> lock(edges_mutex);
+                edges.insert(edges.end(), pending.begin(), pending.begin() + count);
+                count = 0;
+            };
+            for (size_t v = range.begin(); v < range.end(); ++v) {
+                for (Int k = p[v]; k < p[v + 1]; ++k) {
+                    Int u = i[k];
+                    if (u >= Int(v)) continue;
+                    Int a = member[v], b = member[u], r = lca(a, b);
+                    if (r == a || r == b) continue;
+                    if (r < 0 || eligible(r)) {
+                        // Keep the adjacency offset to recover the original scan
+                        // order even when the input columns are not sorted.
+                        pending[count++] = {Int(v), k};
+                        if (count == pending.size()) flush();
+                    }
                 }
             }
-        }
+            if (count) flush();
+        });
         if (edges.empty()) return 0;
+        std::sort(edges.begin(), edges.end());
+        std::vector<size_t> counts(member.size(), 0);
+        for (auto [v, k] : edges) { ++counts[v]; ++counts[i[k]]; }
         auto proposed = member;
-        for (auto [v, u] : edges) {
+        for (auto [v, k] : edges) {
+            Int u = i[k];
             // Confirm that, after previous promotions, the violation still exists.
+            // We needn't re-check eligibility: promotion moves vertices upward
+            // within the existing tree. Cross-root joins may increase depths,
+            // but eligibility was determined by the initial scan, before those joins.
             Int a = proposed[v], b = proposed[u], r = lca(a, b);
-            if (r == a || r == b) continue; // Note that we needn't re-check eligiblity, since promotion only moves vertices upward (lowers depth).
+            if (r == a || r == b) continue;
+            if (r < 0) {
+                while (nodes[a].parent >= 0) a = nodes[a].parent;
+                while (nodes[b].parent >= 0) b = nodes[b].parent;
+                if (nodes.size() >= size_t(std::numeric_limits<Int>::max()))
+                    throw std::overflow_error("persistent separator tree exceeds index range");
+                r = Int(nodes.size());
+                auto first = std::find_if(roots.begin(), roots.end(), [&](Int c) { return c == a || c == b; });
+                Int other = *first == a ? b : a;
+                Node root;
+                root.children = {*first, other};
+                nodes.push_back(std::move(root));
+                nodes[a].parent = nodes[b].parent = r;
+                // Preserve the position of the earlier root and all unrelated roots.
+                *first = r;
+                roots.erase(std::find(first + 1, roots.end(), other));
+                update_depths();
+            }
             // Edges are visited with v > u; ties favor the smaller vertex ID `u`
             proposed[counts[v] > counts[u] ? v : u] = r;
         }
@@ -137,9 +180,6 @@ struct PersistentSeparatorTree {
             --sizes[from];
             ++sizes[to];
         }
-        for (size_t c = 0; c < nodes.size(); ++c)
-            if (!nodes[c].separator_vertices.empty() && sizes[c] == 1) return 0;
-
         // Update the (sorted) separator vertex lists without rebuilding from scratch.
         // Reserve all affected lists before clearing any, so allocation failure
         // preserves all memberships (exception safety).
@@ -351,13 +391,21 @@ struct PersistentSeparatorTree {
             pending.insert(pending.end(), nodes[c].children.begin(), nodes[c].children.end());
         }
         std::reverse(postorder.begin(), postorder.end());
-        for (size_t c = 0; c < postorder.size(); ++c) dense[postorder[c]] = Int(c);
-        for (size_t c = 0; c < postorder.size(); ++c) {
-            Int p = nodes[postorder[c]].parent;
-            parent[c] = p < 0 ? -1 : dense[p];
+        Int nc = 0;
+        for (Int c : postorder)
+            if (!nodes[c].separator_vertices.empty()) dense[c] = nc++;
+        // Map empty nodes to their nearest nonempty ancestor, visiting parents
+        // first. This also keeps the exported component count bounded by n.
+        for (auto it = postorder.rbegin(); it != postorder.rend(); ++it) {
+            Int c = *it, p = nodes[c].parent;
+            if (nodes[c].separator_vertices.empty()) dense[c] = p < 0 ? -1 : dense[p];
+        }
+        for (Int c : postorder) if (!nodes[c].separator_vertices.empty()) {
+            Int p = nodes[c].parent;
+            parent[dense[c]] = p < 0 ? -1 : dense[p];
         }
         for (size_t v = 0; v < member.size(); ++v) membership[v] = dense[member[v]];
-        return Int(postorder.size());
+        return nc;
     }
 };
 

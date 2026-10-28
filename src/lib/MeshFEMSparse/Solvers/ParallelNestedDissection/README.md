@@ -144,10 +144,27 @@ Positive values use `depth(LCA) < d`; values below `-1` are rejected. A zero
 reuse period disables all temporal reuse regardless of promotion depth.
 Changing either setting resets history. Promotion does not bypass periodic
 refresh, and the default remains unchanged unless explicitly enabled.
-Promotions are committed only after ordering succeeds. Cross-root edges and
-moves that would empty a tree node fall back to ordinary rebuilding. CAMD still
-runs on every analysis. `temporalReuseStatistics["promoted_vertices"]` reports
+Promotions are committed only after ordering succeeds. With promotion enabled,
+cross-root edges create a new parent over just the two affected trees and
+promote an endpoint into it. Depth eligibility is determined before these joins;
+the increased depths apply to the next analysis. Empty separators remain in the
+internal hierarchy and can receive vertices again, but are omitted from the
+exported forest, attaching descendants to the nearest nonempty ancestor.
+The full-graph scan runs in parallel with stack-buffered collection of violations;
+promotion retains the original graph traversal order regardless of scheduling.
+By default CAMD still runs on every analysis. `temporalReuseStatistics["promoted_vertices"]` reports
 the number of distinct vertices promoted on the last successful analysis.
+
+Optional `CatamariFactorizer::setUseCAMDRepair(true)` (Python:
+`factorizer.use_camd_repair = True`, default `False`) retains the previous
+within-separator ordering and appends promoted vertices to their destination
+separator. Separator blocks follow the updated tree's postorder. This skips
+CAMD only when no subtrees were rebuilt and compatible permutation history is
+available. Full/periodic ND and subtree repairs run normal CAMD; changes to CAMD
+settings refresh the ordering. Changing this option through the wrapper resets
+history. `temporalReuseStatistics["camd_repaired"]` reports use of the fast path.
+This heuristic preserves ND constraints, but can increase fill or numeric cost;
+symbolic factorization is still recomputed on the current graph.
 
 A full ND recomputation is also triggered if our `SparseLRU`
 initiates a re-factorization due to entry cache expiration.

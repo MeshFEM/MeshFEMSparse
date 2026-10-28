@@ -20,6 +20,7 @@
 #include <sstream>
 #include <algorithm>
 #include <numeric>
+#include <memory>
 #include <string>
 #include <cstring>
 #include <stdexcept>
@@ -1042,8 +1043,9 @@ struct CSCMatrix {
         return result;
     }
 
+    // Parallel expansion is opt-in: `value` must be pure and thread-safe.
     template<typename T = _Real, class ValueGetter>
-    CSCMatrix<_Index, T> toSymmetryModeImpl(SymmetryMode newMode, const ValueGetter &value) const {
+    CSCMatrix<_Index, T> toSymmetryModeImpl(SymmetryMode newMode, const ValueGetter &value, bool parallel = false) const {
         using Result = CSCMatrix<_Index, T>;
         if (newMode == symmetry_mode) {
             Result result(m, n);
@@ -1059,6 +1061,92 @@ struct CSCMatrix {
         // Replicating an upper/lower triangle matrix to a full matrix.
         if (newMode == SymmetryMode::NONE) {
             Result result(m, n);
+            size_t chunks = 1;
+#ifdef MESHFEM_WITH_TBB
+            if (parallel && n > 0) {
+                // One histogram per source-column chunk, in a single allocation.
+                // Bound scratch to half the input index count and 8 MiB so
+                // histogram overhead does not dominate sparse inputs.
+                chunks = std::min<size_t>({size_t(get_max_num_tbb_threads()), size_t(tbb::this_task_arena::max_concurrency()), size_t(n),
+                    size_t(nz) / 8192, size_t(nz) / size_t(n) / 2,
+                    (8 * 1024 * 1024 / sizeof(_Index)) / size_t(n)});
+            }
+#else
+            unused(parallel);
+#endif
+            if (chunks > 1) {
+                // BENCHMARK_SCOPED_TIMER_SECTION timer("Parallel symmetry expansion");
+                if (symmetry_mode != SymmetryMode::UPPER_TRIANGLE && symmetry_mode != SymmetryMode::LOWER_TRIANGLE)
+                    throw std::logic_error("Unexpected conversion request");
+                const bool upper = symmetry_mode == SymmetryMode::UPPER_TRIANGLE;
+                std::unique_ptr<_Index[]> cursors(new _Index[chunks * size_t(n)]);
+                {
+                    // BENCHMARK_SCOPED_TIMER_SECTION t("Count reflected entries");
+                    parallel_for_range(chunks, [&](size_t chunk) {
+                        _Index *counts = cursors.get() + chunk * size_t(n);
+                        std::fill(counts, counts + n, 0);
+                        for (_Index j = size_t(n) * chunk / chunks; j < _Index(size_t(n) * (chunk + 1) / chunks); ++j) {
+                            for (_Index k = Ap[j]; k < Ap[j + 1]; ++k) {
+                                _Index i = Ai[k];
+                                if (upper ? i > j : i < j) throw std::runtime_error("Symmetry mode violation");
+                                if (i != j) ++counts[i];
+                            }
+                        }
+                    });
+                }
+                {
+                    // BENCHMARK_SCOPED_TIMER_SECTION t("Column offsets");
+                    result.Ap.resize(n + 1);
+                    result.Ap[0] = 0;
+                    parallel_for_range(chunks, [&](size_t task) {
+                        for (_Index j = size_t(n) * task / chunks; j < _Index(size_t(n) * (task + 1) / chunks); ++j) {
+                            _Index count = Ap[j + 1] - Ap[j];
+                            for (size_t chunk = 0; chunk < chunks; ++chunk) count += cursors[chunk * size_t(n) + j];
+                            result.Ap[j + 1] = count;
+                        }
+                    });
+                    for (_Index j = 0; j < n; ++j) result.Ap[j + 1] += result.Ap[j];
+                    parallel_for_range(chunks, [&](size_t task) {
+                        for (_Index j = size_t(n) * task / chunks; j < _Index(size_t(n) * (task + 1) / chunks); ++j) {
+                            _Index back = result.Ap[j] + (upper ? Ap[j + 1] - Ap[j] : 0);
+                            // Earlier source chunks write earlier reflected rows.
+                            // Thus each column stays sorted without atomics or sorting.
+                            for (size_t chunk = 0; chunk < chunks; ++chunk) {
+                                auto &cursor = cursors[chunk * size_t(n) + j];
+                                _Index count = cursor;
+                                cursor = back;
+                                back += count;
+                            }
+                        }
+                    });
+                    result.nz = result.Ap[n];
+                }
+                {
+                    // BENCHMARK_SCOPED_TIMER_SECTION t("Allocate Ai, Ax");
+                    result.Ai.resize(result.nz);
+                    result.Ax.resize(result.nz);
+                }
+                {
+                    // BENCHMARK_SCOPED_TIMER_SECTION t("Fill entries");
+                    parallel_for_range(chunks, [&](size_t chunk) {
+                        _Index *reflected = cursors.get() + chunk * size_t(n);
+                        for (_Index j = size_t(n) * chunk / chunks; j < _Index(size_t(n) * (chunk + 1) / chunks); ++j) {
+                            _Index direct = upper ? result.Ap[j] : result.Ap[j + 1] - (Ap[j + 1] - Ap[j]);
+                            for (_Index k = Ap[j]; k < Ap[j + 1]; ++k) {
+                                _Index i = Ai[k];
+                                result.Ai[direct] = i;
+                                result.Ax[direct++] = value(k);
+                                if (i != j) {
+                                    _Index dst = reflected[i]++;
+                                    result.Ai[dst] = j;
+                                    result.Ax[dst] = value(k);
+                                }
+                            }
+                        }
+                    });
+                }
+                return result;
+            }
             typename Result::InOrderBuilder builder(result, [this](_Index *colSizes) {
                 for (_Index j = 0; j < n; ++j) {
                     for (_Index inLoc = Ap[j]; inLoc < Ap[j + 1]; ++inLoc) {

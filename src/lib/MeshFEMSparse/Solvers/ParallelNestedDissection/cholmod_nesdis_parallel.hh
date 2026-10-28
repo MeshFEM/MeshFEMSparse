@@ -32,6 +32,7 @@ namespace MeshFEM::CholmodParallelNesdis {
 
 struct TemporalReuseStatistics {
     bool full_rebuild = false;
+    bool camd_repaired = false; // Reused within-separator ordering; skipped CAMD.
     size_t graph_vertices = 0;
     size_t recomputed_subtrees = 0;
     size_t repartitioned_vertices = 0;
@@ -47,12 +48,17 @@ template<class Int>
 struct TemporalReuseState {
     size_t temporal_reuse_period = 0; // 0 disables; P permits P incremental calls.
     int promotion_depth = 0; // 0: off; -1: all; positive: depth(LCA) < cutoff.
+    bool use_camd_repair = false; // Append promoted vertices; refresh after subtree/full ND.
     PersistentSeparatorTree<Int> tree;
+    std::vector<Int> permutation; // Previous elimination order, only cached when enabled.
+    std::string ordering_settings;
     size_t incremental_analyses_since_rebuild = 0;
     TemporalReuseStatistics statistics;
     std::string partition_settings;
     void reset() {
         tree = {};
+        permutation.clear();
+        ordering_settings.clear();
         incremental_analyses_since_rebuild = 0;
         statistics = {};
         partition_settings.clear();

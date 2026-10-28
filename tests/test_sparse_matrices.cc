@@ -1,4 +1,7 @@
 #include <MeshFEMSparse/SparseMatrices.hh>
+#ifdef MESHFEM_WITH_TBB
+#include <tbb/global_control.h>
+#endif
 
 using namespace MeshFEM;
 // WARNING: catch2/catch.hpp sets a BENCHMARK macro, so we must include it
@@ -6,6 +9,60 @@ using namespace MeshFEM;
 #include <catch2/catch.hpp>
 #include <cstdlib>
 #include <random>
+
+TEMPLATE_TEST_CASE("parallel symmetry expansion matches serial storage", "[sparse_matrix][symmetry_expansion]", int32_t, int64_t) {
+    using Int = TestType;
+    using Matrix = CSCMatrix<Int, double>;
+    const Int n = GENERATE(0, 1, 1024);
+    const bool upper = GENERATE(false, true), diagonal = GENERATE(false, true);
+    Matrix matrix(n, n);
+    matrix.symmetry_mode = upper ? Matrix::SymmetryMode::UPPER_TRIANGLE : Matrix::SymmetryMode::LOWER_TRIANGLE;
+    matrix.Ap.assign(n + 1, 0);
+    std::vector<Int> rows;
+    for (Int j = 0; j < n; ++j) {
+        // Include empty columns, absent diagonals, and reflected writes crossing
+        // source-chunk boundaries. Values also identify the source entry.
+        if (j % 17 != 16) {
+            Int begin = upper ? std::max<Int>(0, j - 64) : j;
+            Int end = upper ? j + 1 : std::min<Int>(n, j + 65);
+            for (Int i = begin; i < end; ++i) {
+                if (i == j && !diagonal) continue;
+                rows.push_back(i);
+                matrix.Ax.push_back(double(rows.size()) / 13);
+            }
+        }
+        matrix.Ap[j + 1] = Int(rows.size());
+    }
+    matrix.Ai.resize(rows.size());
+    for (size_t k = 0; k < rows.size(); ++k) matrix.Ai[k] = rows[k];
+    matrix.nz = matrix.Ai.size();
+    const auto value = [&](size_t k) { return matrix.Ax[k]; };
+    const auto source = [](size_t k) { return Int(k); };
+    const auto serial = matrix.toSymmetryModeImpl(Matrix::SymmetryMode::NONE, value);
+    const auto serial_sources = matrix.template toSymmetryModeImpl<Int>(Matrix::SymmetryMode::NONE, source);
+    for (size_t threads : {1, 2, 4}) {
+#ifdef MESHFEM_WITH_TBB
+        tbb::global_control control(tbb::global_control::max_allowed_parallelism, threads);
+#endif
+        CAPTURE(n, upper, diagonal, threads);
+        const auto parallel = matrix.toSymmetryModeImpl(Matrix::SymmetryMode::NONE, value, true);
+        const auto parallel_sources = matrix.template toSymmetryModeImpl<Int>(Matrix::SymmetryMode::NONE, source, true);
+        REQUIRE(parallel.m == n);
+        REQUIRE(parallel.n == n);
+        REQUIRE(parallel.nz == serial.nz);
+        REQUIRE(parallel.symmetry_mode == Matrix::SymmetryMode::NONE);
+        REQUIRE(parallel.Ap == serial.Ap);
+        REQUIRE(parallel.Ai == serial.Ai);
+        REQUIRE(parallel.Ax == serial.Ax);
+        REQUIRE(parallel_sources.Ap == serial_sources.Ap);
+        REQUIRE(parallel_sources.Ai == serial_sources.Ai);
+        REQUIRE(parallel_sources.Ax == serial_sources.Ax);
+    }
+    if (n > 1) {
+        matrix.Ai[matrix.Ap[n / 2]] = n / 2 + (upper ? 1 : -1);
+        REQUIRE_THROWS(matrix.toSymmetryModeImpl(Matrix::SymmetryMode::NONE, value, true));
+    }
+}
 
 TEST_CASE("sparse matrix format conversions", "[sparse_matrix]" ) {
     using VXd = Eigen::VectorXd;

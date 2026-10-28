@@ -227,6 +227,47 @@ private:
     VecX_T<catamari::Int> m_sourceLocForCatamariInputEntry; // For legacy mode only
 };
 
+#ifndef MESHFEM_USE_LEGACY_CATAMARI
+// Own the symmetry-expanded pattern through analysis and conversion-plan
+// construction. Numeric values are subsequently read directly from the source
+// matrix using the plan; no CoordinateMatrix is needed.
+struct CatamariPatternConverter {
+    using Pattern = CSCMatrix<SuiteSparse_long, SuiteSparse_long>;
+    explicit CatamariPatternConverter(const SuiteSparseMatrix &Asp) {
+        BENCHMARK_SCOPED_TIMER_SECTION timer("CatamariConverter");
+        if (Asp.symmetry_mode != SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE || Asp.m != Asp.n)
+            throw std::runtime_error("Expected a square upper-triangle pattern");
+        {
+            BENCHMARK_SCOPED_TIMER_SECTION t2("toSymmetryMode");
+            m_pattern = Asp.toSymmetryModeImpl<SuiteSparse_long>(SuiteSparseMatrix::SymmetryMode::NONE,
+                                                               [](size_t ii) { return ii; }, /* parallel = */ true);
+        }
+        m_sourceReducedEntryForFullMatrixEntry = std::move(m_pattern.Ax);
+    }
+
+    catamari::SparsePatternView<SuiteSparse_long> get() const {
+        return {m_pattern.n, m_pattern.Ap.data(), m_pattern.Ai.data()};
+    }
+    const Pattern &fullPattern() const { return m_pattern; }
+    void freePattern() {
+        {
+            // BENCHMARK_SCOPED_TIMER_SECTION timer("Expanded pattern");
+            m_pattern = {};
+        }
+        {
+            // BENCHMARK_SCOPED_TIMER_SECTION timer("Source entry map");
+            std::vector<SuiteSparse_long>().swap(m_sourceReducedEntryForFullMatrixEntry);
+        }
+    }
+
+    std::vector<SuiteSparse_long> m_sourceReducedEntryForFullMatrixEntry;
+    catamari::ConversionPlan conversionPlan;
+
+private:
+    Pattern m_pattern;
+};
+#endif
+
 using CatamariConverter = CatamariConverterT<double>;
 
 } // namespace MeshFEM

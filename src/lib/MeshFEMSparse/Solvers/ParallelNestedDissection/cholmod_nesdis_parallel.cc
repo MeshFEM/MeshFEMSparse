@@ -9,6 +9,7 @@
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <iomanip>
 #include <stdexcept>
@@ -1384,8 +1385,9 @@ static std::string partition_settings(const cholmod_common &common, const Nesdis
 // reuse period, and preserves vertex identities across analyses (reset after
 // relabeling). Missing/incompatible history, period expiry, or a global separator
 // violation triggers full ND; otherwise repair only dirty subtrees with NDOnly.
-// In either case, run final constrained ordering on the current graph; repaired
-// or unchanged forests are flattened through ReusedTree without repeating ND.
+// In either case, run final constrained ordering on the current graph, unless
+// the previous permutation can be repaired without rebuilding any subtrees.
+// Repaired or unchanged forests are flattened through ReusedTree without repeating ND.
 // Commit history only after success; an empty input clears the history.
 template<class Int>
 static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t fsize,
@@ -1407,6 +1409,13 @@ static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t f
     // Changing promotion policy starts fresh history, including for direct
     // callers that configure TemporalReuseState without the wrapper setters.
     auto settings = partition_settings(*Common, options) + " promotion " + std::to_string(reuse.promotion_depth);
+    const auto &method = Common->method[Common->current];
+    // Only symmetric CAMD orderings participate. Changes to final-ordering
+    // settings force CAMD without unnecessarily rebuilding the ND tree.
+    const bool cache_ordering = reuse.use_camd_repair && A->stype != 0 && method.nd_camd == 1;
+    std::string ordering_settings;
+    if (cache_ordering) ordering_settings = std::to_string(method.aggressive) + " " +
+        std::to_string(options.camd.cut_depth) + " " + std::to_string(options.camd.skip_upper);
     const bool have_tree = !reuse.tree.roots.empty() && reuse.tree.member.size() == A->nrow;
     bool full = !have_tree || settings != reuse.partition_settings ||
         reuse.incremental_analyses_since_rebuild >= reuse.temporal_reuse_period;
@@ -1501,7 +1510,30 @@ static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t f
         statistics.recomputed_subtrees = regions.size();
         const double repair_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count();
-        {
+        if (cache_ordering && dirty.roots.empty() && reuse.permutation.size() == A->nrow &&
+            reuse.ordering_settings == ordering_settings) {
+            // BENCHMARK_SCOPED_TIMER_SECTION timer("temporal CAMD repair");
+            nc = tree->flatten(CParent, Cmember);
+            if (!statistics.promoted_vertices) {
+                // Hierarchical CAMD may interleave independent subtrees. Keep
+                // that order exactly when separator membership did not change.
+                std::copy(reuse.permutation.begin(), reuse.permutation.end(), Perm);
+            }
+            else {
+                // Stable buckets in current separator postorder. Original residents
+                // precede arrivals; each group retains its previous relative order.
+                std::vector<Int> next(nc + 1, 0);
+                for (size_t v = 0; v < A->nrow; ++v) ++next[Cmember[v] + 1];
+                std::partial_sum(next.begin(), next.end(), next.begin());
+                for (bool moved : {false, true})
+                    for (Int v : reuse.permutation)
+                        if ((tree->member[v] != reuse.tree.member[v]) == moved)
+                            Perm[next[Cmember[v]]++] = v;
+            }
+            statistics.camd_repaired = true;
+            Common->lnz = Common->fl = -1; // No current CAMD estimates.
+        }
+        else {
             BENCHMARK_SCOPED_TIMER_SECTION timer("nested_dissection_impl");
             nc = nested_dissection_impl<Int>(A, fset, fsize, Perm, CParent, Cmember,
                 Common, options, FullGraph, tree, false, &ordering_nd_seconds);
@@ -1509,10 +1541,15 @@ static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t f
         if (nc < 0) return nc;
         statistics.nd_seconds = repair_seconds + ordering_nd_seconds;
     }
+    // Allocate the history before committing either the tree or permutation.
+    std::vector<Int> permutation;
+    if (cache_ordering) permutation.assign(Perm, Perm + A->nrow);
     // Commit only after the final CAMD/permutation stage has succeeded.
     if (full || !dirty.roots.empty() || statistics.promoted_vertices) reuse.tree = std::move(candidate);
     reuse.incremental_analyses_since_rebuild = full ? 0 : reuse.incremental_analyses_since_rebuild + 1;
     reuse.partition_settings = std::move(settings);
+    reuse.permutation = std::move(permutation);
+    reuse.ordering_settings = std::move(ordering_settings);
     reuse.statistics = statistics;
     return nc;
 }
