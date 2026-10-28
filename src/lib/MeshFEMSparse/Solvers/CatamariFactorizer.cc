@@ -629,6 +629,7 @@ void CatamariFactorizer::m_factorizeSymbolic(State<Field> &state, const SuiteSpa
         // Scale dense dimensions and permutations while retaining compact row indices.
         ldl_block = std::move(state.ldl);
         state.ldl = ldl_block->ExpandSymbolicFactorizationToScalar(m_blockSize);
+        state.ldl->elimination_workspace = std::move(ldl_block->elimination_workspace);
     }
 
     if (!m_legacy) {

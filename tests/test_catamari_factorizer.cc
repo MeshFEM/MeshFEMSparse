@@ -503,6 +503,64 @@ TEST_CASE("Catamari compact block maps survive forest factorization and reuse", 
     SECTION("three components per block") { checkBlockForest<3>(single, left); }
 }
 
+TEST_CASE("Catamari elimination workspace survives changing graphs and arenas", "[catamari][symbolic_workspace]") {
+    using namespace catamari;
+    SparseLDL<double> factor;
+    SparseLDLControl<double> control;
+    control.supernodal_strategy = kSupernodalFactorization;
+    int step = 0;
+    for (Int width : {12, 12, 4, 28, 28, 1}) {
+        const Int n = 3 * width + 2;
+        const int threads = 1 + step % 4;
+        tbb::task_arena arena(threads);
+        SymmetricOrdering ordering;
+        ordering.supernode_sizes = Buffer<Int>{width, width, width, 2};
+        OffsetScan(ordering.supernode_sizes, &ordering.supernode_offsets);
+        ordering.assembly_forest.parents = Buffer<Int>{2, 2, -1, -1};
+        ordering.assembly_forest.FillFromParents();
+        ordering.permutation.Resize(n);
+        ordering.inverse_permutation.Resize(n);
+        auto original = [&](Int i) { return step % 2 ? n - 1 - i : i; };
+        for (Int i = 0; i < n; ++i) {
+            ordering.inverse_permutation[i] = original(i);
+            ordering.permutation[original(i)] = i;
+        }
+        CoordinateMatrix<double> matrix;
+        matrix.Resize(n, n);
+        for (Int i = 0; i < n; ++i) {
+            matrix.QueueEntryAddition(original(i), original(i), n + 1.0);
+            for (Int j = i + 1; j < n; ++j) {
+                const bool same_tree = (i < 3 * width) == (j < 3 * width);
+                const bool separated = i < width && j >= width && j < 2 * width;
+                if (!same_tree || separated || (13 * i + 7 * j + step) % 11 > 3) continue;
+                matrix.QueueEntryAddition(original(i), original(j), -0.25);
+                matrix.QueueEntryAddition(original(j), original(i), -0.25);
+            }
+        }
+        matrix.FlushEntryQueues();
+        Buffer<Int> parents, degrees;
+        scalar_ldl::EliminationForestAndDegrees(matrix, ordering, &parents, &degrees);
+        auto& workspace = factor.elimination_workspace;
+        const auto* old_heads = workspace.child_heads.Data();
+        const auto old_capacity = workspace.child_heads.Capacity();
+        arena.execute([&] {
+            scalar_ldl::ParallelEliminationForestAndDegrees(
+                matrix, ordering, &workspace.parents, &workspace.degrees, &workspace);
+        });
+        REQUIRE(workspace.parents == parents);
+        REQUIRE(workspace.degrees == degrees);
+        if (old_capacity >= UInt(n)) REQUIRE(workspace.child_heads.Data() == old_heads);
+        const auto* heads = workspace.child_heads.Data();
+        arena.execute([&] { factor.Factor(matrix, ordering, control, true); });
+        REQUIRE(workspace.parents == parents);
+        REQUIRE(workspace.degrees == degrees);
+        REQUIRE(workspace.child_heads.Data() == heads);
+        auto clone = factor.Clone();
+        REQUIRE(clone->elimination_workspace.child_heads.Empty());
+        ++step;
+    }
+}
+
 TEST_CASE("Catamari symbolic scaling never expands stored row indices", "[catamari][block_indices]") {
     using namespace catamari;
     using namespace catamari::supernodal_ldl;
