@@ -71,6 +71,86 @@ struct PersistentSeparatorTree {
         return a == b ? a : Int(-1);
     }
 
+    // Repair separator violations made by edges of the new graph
+    // (represented in CSR/CSC format by arrays `p`, `i`) that occur
+    // at separator tree nodes above a depth `cutoff`; the goal is to
+    // avoid rerunning nested dissection on the violated subtree by
+    // instead merging an edge endpoint into the subtree root (LCA).
+    //
+    // Root depth is zero, so a `cutoff` of 0 disables promotion, a
+    // positive `cutoff` permits `depth(LCA) < cutoff`, and a special
+    // value of `cutoff = -1` permits repair at all levels, effectively
+    // disabling subtree ND calls.
+    //
+    // Return the number of distinct moved vertices.
+    //
+    // Currently if the separator tree is actually a forest
+    // (e.g., arising from two disconnected simulation bodies),
+    // and if a new edge connects vertices belonging to different trees,
+    // a full rebuild is triggered. We will address this later by
+    // creating and then glomming into a new root node.
+    // We also currently give up and rebuild if any separator node is emptied.
+    size_t promote_violations(const Int *p, const Int *i, int cutoff) {
+        if (cutoff < -1) throw std::invalid_argument("invalid temporal reuse promotion depth");
+        if (cutoff == 0) return 0;
+        auto eligible = [&](Int r) { return cutoff < 0 || depth[r] < cutoff; };
+        // Scan the full graph collecting edges that violate the separator tree
+        // at a depth that makes them elegible for promotion.
+        std::vector<std::pair<Int, Int>> edges;
+        std::vector<size_t> counts(member.size(), 0);
+        for (size_t v = 0; v < member.size(); ++v) {
+            for (Int k = p[v]; k < p[v + 1]; ++k) {
+                Int u = i[k];
+                if (u >= Int(v)) continue;
+                Int a = member[v], b = member[u], r = lca(a, b);
+                if (r == a || r == b) continue;
+                if (r < 0) return 0;
+                if (eligible(r)) {
+                    edges.emplace_back(Int(v), u);
+                    ++counts[v]; ++counts[u];
+                }
+            }
+        }
+        if (edges.empty()) return 0;
+        auto proposed = member;
+        for (auto [v, u] : edges) {
+            // Confirm that, after previous promotions, the violation still exists.
+            Int a = proposed[v], b = proposed[u], r = lca(a, b);
+            if (r == a || r == b) continue; // Note that we needn't re-check eligiblity, since promotion only moves vertices upward (lowers depth).
+            // Edges are visited with v > u; ties favor the smaller vertex ID `u`
+            proposed[counts[v] > counts[u] ? v : u] = r;
+        }
+
+        // Determine whether each separator's vertex membership has changed and, if so, its new size.
+        // This information is encoded in a single `size_t` that is 0 for
+        // no change and `new_size + 1`; note that `new_size` can be the same as
+        // the old size even when there are changes (if a vertex is added and removed),
+        // and this is properly handled.
+        size_t moved = 0;
+        std::vector<size_t> sizes(nodes.size(), 0);
+        for (size_t v = 0; v < member.size(); ++v) {
+            Int from = member[v], to = proposed[v];
+            if (from == to) continue;
+            ++moved;
+            if (!sizes[from]) sizes[from] = nodes[from].separator_vertices.size() + 1;
+            if (!sizes[to])   sizes[  to] = nodes[  to].separator_vertices.size() + 1;
+            --sizes[from];
+            ++sizes[to];
+        }
+        for (size_t c = 0; c < nodes.size(); ++c)
+            if (!nodes[c].separator_vertices.empty() && sizes[c] == 1) return 0;
+
+        // Update the (sorted) separator vertex lists without rebuilding from scratch.
+        // Reserve all affected lists before clearing any, so allocation failure
+        // preserves all memberships (exception safety).
+        for (size_t c = 0; c < nodes.size(); ++c) if (sizes[c]) nodes[c].separator_vertices.reserve(sizes[c] - 1);
+        for (size_t c = 0; c < nodes.size(); ++c) if (sizes[c]) nodes[c].separator_vertices.clear();
+        for (size_t v = 0; v < member.size(); ++v) if (sizes[proposed[v]]) nodes[proposed[v]].separator_vertices.push_back(Int(v));
+        member.swap(proposed);
+
+        return moved;
+    }
+
     // Scan one triangle of a symmetric, packed CSC graph. An edge between
     // distinct roots, or a violation at the sole root, requests a full rebuild.
     // A dirty root in a larger forest can be repaired independently.

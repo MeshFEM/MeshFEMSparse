@@ -35,6 +35,7 @@ struct TemporalReuseStatistics {
     size_t graph_vertices = 0;
     size_t recomputed_subtrees = 0;
     size_t repartitioned_vertices = 0;
+    size_t promoted_vertices = 0; // Distinct endpoints moved into separators.
     double nd_seconds = 0; // Graph preparation, validation and ND; excludes CAMD.
 };
 
@@ -45,6 +46,7 @@ struct TemporalReuseStatistics {
 template<class Int>
 struct TemporalReuseState {
     size_t temporal_reuse_period = 0; // 0 disables; P permits P incremental calls.
+    int promotion_depth = 0; // 0: off; -1: all; positive: depth(LCA) < cutoff.
     PersistentSeparatorTree<Int> tree;
     size_t incremental_analyses_since_rebuild = 0;
     TemporalReuseStatistics statistics;

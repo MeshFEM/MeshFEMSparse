@@ -102,6 +102,8 @@ struct MESHFEM_EXPORT CatamariFactorizer final : public CholeskyFactorizerBase {
     // changes reset automatically; explicitly reset after other relabelings.
     void setTemporalReusePeriod(size_t period) { m_cholmodOrdering.setTemporalReusePeriod(period); }
     size_t temporalReusePeriod() const { return m_cholmodOrdering.temporalReusePeriod(); }
+    void setTemporalReusePromotionDepth(int depth) { m_cholmodOrdering.setTemporalReusePromotionDepth(depth); }
+    int temporalReusePromotionDepth() const { return m_cholmodOrdering.temporalReusePromotionDepth(); }
     void resetAnalysisPhaseTemporalCache() override { m_cholmodOrdering.resetTemporalReuse(); }
 #if MESHFEM_WITH_CHOLMOD
     const CholmodParallelNesdis::TemporalReuseStatistics &temporalReuseStatistics() const {

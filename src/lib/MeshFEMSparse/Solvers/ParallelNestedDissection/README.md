@@ -104,11 +104,15 @@ Our implementation differs from the one described in the paper in a few ways:
   ordering (along with the separator tree) and slicing in updated CAMD orderings
   for just the rebuilt subtrees. However, the global CAMD time currently does not
   appear to be a major bottleneck.
-- It does not implement certain features like aggressive reuse (the importance of which
-  is deemphasized somewhat in the PARTH supplement) or support addition or removal of
-  system variables. These features could be added in the future if we notice
-  bottlenecks that they could resolve, but for now we hope that our faster parallel
-  ND implementation will already larly mitigate such slowdowns.
+- The optional separator promotion feature repairs separator subtree violations
+  without rerunning dissection. It is essentially equivalent to PARTH's
+  "aggressive reuse" strategy apart from a few minor details related to how
+  violating edges are prioritized and which endpoint is selected for merging
+  into a separator. This strategy can be applied to separators above a chosen
+  depth threshold (`temporalReusePromotionDepth`); is this depth exceeds the
+  separator tree depth--or if the special value of `-1` is selected--then *all*
+  nested dissection calls are avoided during the update in favor of the simple
+  glom-onto-separator approach.
 
 Note that the PARTH approach can degrade ordering since it only rebuilds
 separators when new edges violate them and does not revisit ordering when old
@@ -119,10 +123,32 @@ ND partitioning occasionally. Ideally this rebuild would be driven by
 some principled estimate of separator tree quality/staleness, but for now
 we simply rebuild it after a fixed number of analyiss calls
 (after expiration of a "reuse period").
-Selecting `CholeskyProvider::CatamariNesdisReuse` configures a default reuse period of 32
+Selecting `CholeskyProvider::CatamariNesdisReuse` configures a default reuse period of 64
 that can be overriden by a call to
 `CatamariFactorizer::setTemporalReusePeriod(P)` (Python:
 `factorizer.temporalReusePeriod = P`).
+
+Promotion is off by default and configured independently by
+`CatamariFactorizer::setTemporalReusePromotionDepth(d)` (Python:
+`factorizer.temporalReusePromotionDepth = d`):
+
+| `d` | Eligible separator depths (root depth 0) |
+| --- | --- |
+| `0` | None: retain ordinary subtree repair |
+| `1` | Root only |
+| `2` | Depths 0–1 |
+| `3` | Depths 0–2 (PARTH's default depth cutoff) |
+| `-1` | All levels |
+
+Positive values use `depth(LCA) < d`; values below `-1` are rejected. A zero
+reuse period disables all temporal reuse regardless of promotion depth.
+Changing either setting resets history. Promotion does not bypass periodic
+refresh, and the default remains unchanged unless explicitly enabled.
+Promotions are committed only after ordering succeeds. Cross-root edges and
+moves that would empty a tree node fall back to ordinary rebuilding. CAMD still
+runs on every analysis. `temporalReuseStatistics["promoted_vertices"]` reports
+the number of distinct vertices promoted on the last successful analysis.
+
 A full ND recomputation is also triggered if our `SparseLRU`
 initiates a re-factorization due to entry cache expiration.
 

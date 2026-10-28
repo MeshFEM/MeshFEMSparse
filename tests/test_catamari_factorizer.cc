@@ -349,6 +349,7 @@ TEST_CASE("Catamari temporal ND provider defaults to 64 incremental analyses", "
     REQUIRE(f != nullptr);
     REQUIRE(f->orderingMethod == CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
     REQUIRE(f->temporalReusePeriod() == 64);
+    REQUIRE(f->temporalReusePromotionDepth() == 0);
     REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisReuse);
 
     TripletMatrix<> triplets(16, 16);
@@ -373,8 +374,27 @@ TEST_CASE("Catamari temporal ND provider defaults to 64 incremental analyses", "
 
     f->setTemporalReusePeriod(8);
     REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisReuse);
+    f->setTemporalReusePromotionDepth(3);
+    REQUIRE(f->temporalReusePromotionDepth() == 3);
+    REQUIRE(f->temporalReusePeriod() == 8);
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE(f->temporalReuseStatistics().full_rebuild);
+    f->setTemporalReusePromotionDepth(3); // Reassigning a setting retains history.
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE_FALSE(f->temporalReuseStatistics().full_rebuild);
+    REQUIRE_THROWS_AS(f->setTemporalReusePromotionDepth(-2), std::invalid_argument);
+    REQUIRE(f->temporalReusePromotionDepth() == 3);
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE_FALSE(f->temporalReuseStatistics().full_rebuild);
+    f->setTemporalReusePromotionDepth(-1);
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE(f->temporalReuseStatistics().full_rebuild);
+    f->resetAnalysisPhaseTemporalCache();
+    REQUIRE(f->temporalReusePromotionDepth() == -1);
     f->setTemporalReusePeriod(0);
     REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisParallel);
+    base->factorizeSymbolic(matrix, {}); // The period remains the master enable.
+    REQUIRE(f->temporalReuseStatistics().graph_vertices == 0);
     auto plain = make_cholesky_factorizer(CholeskyProvider::CatamariNesdisParallel, single);
     REQUIRE(plain->provider() == CholeskyProvider::CatamariNesdisParallel);
     REQUIRE(dynamic_cast<CatamariFactorizer &>(*plain).temporalReusePeriod() == 0);

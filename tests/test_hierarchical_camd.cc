@@ -905,6 +905,144 @@ TEMPLATE_TEST_CASE("temporal ND repairs induced subgraphs and reruns CAMD", "[te
     REQUIRE(member == last_member);
 }
 
+TEMPLATE_TEST_CASE("temporal ND promotion cutoff preserves lower subtree repair", "[temporal_nd][promotion]", int32_t, int64_t) {
+    using Int = TestType;
+    const int cutoff = GENERATE(0, 1, 2, 3, -1);
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    Environment camd("CHOLMOD_NESDIS_CAMD_CUT_DEPTH", "4");
+    Environment verify("CHOLMOD_NESDIS_CAMD_VERIFY", "1");
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    common.value.method[0].nd_small = 4;
+    common.value.method[0].nd_compress = GENERATE(0, 1);
+    common.value.method[0].prune_dense = -1;
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 2;
+    reuse.promotion_depth = cutoff;
+    auto edges = test_temporal_edges<Int>();
+    std::vector<Int> parent(30), member(30), perm(30);
+    auto order = [&](const Graph<Int> &graph) {
+        auto nc = nested_dissection_from_graph<Int>(graph.view, perm.data(), parent.data(), member.data(), &common.value, &reuse);
+        REQUIRE(common.value.status == CHOLMOD_OK);
+        check_separator_forest(graph, Int(nc), parent, member, perm);
+    };
+    Graph<Int> initial(30, edges);
+    order(initial);
+    reuse.tree = test_temporal_tree<Int>();
+    // Three independent violations, at root depth 0, depth 1, and depth 2.
+    edges.emplace_back(0, 14);
+    edges.emplace_back(18, 24);
+    edges.emplace_back(6, 8);
+    Graph<Int> changed(30, edges);
+    order(changed);
+    if (cutoff == 0) {
+        REQUIRE(reuse.statistics.full_rebuild);
+        REQUIRE(reuse.statistics.promoted_vertices == 0);
+        REQUIRE(reuse.statistics.repartitioned_vertices == 30);
+    }
+    else {
+        REQUIRE_FALSE(reuse.statistics.full_rebuild);
+        REQUIRE(reuse.statistics.promoted_vertices == size_t(cutoff == 1 ? 1 : cutoff == 2 ? 2 : 3));
+        REQUIRE(reuse.statistics.recomputed_subtrees == size_t(cutoff == 1 ? 2 : cutoff == 2 ? 1 : 0));
+        REQUIRE(reuse.statistics.repartitioned_vertices == size_t(cutoff == 1 ? 20 : cutoff == 2 ? 6 : 0));
+        REQUIRE(reuse.tree.member[0] == 14);
+        for (const auto &node : reuse.tree.nodes)
+            REQUIRE(std::is_sorted(node.separator_vertices.begin(), node.separator_vertices.end()));
+        auto promoted_member = reuse.tree.member;
+        // A rejected direct-API setting must retain all successful history.
+        auto statistics = reuse.statistics;
+        reuse.promotion_depth = -2;
+        REQUIRE(nested_dissection_from_graph<Int>(changed.view, perm.data(), parent.data(), member.data(), &common.value, &reuse) < 0);
+        REQUIRE(reuse.tree.member == promoted_member);
+        REQUIRE(reuse.statistics.promoted_vertices == statistics.promoted_vertices);
+        REQUIRE(reuse.incremental_analyses_since_rebuild == 1);
+        reuse.promotion_depth = cutoff;
+        order(changed);
+        REQUIRE_FALSE(reuse.statistics.full_rebuild);
+        REQUIRE(reuse.statistics.promoted_vertices == 0);
+        REQUIRE(reuse.statistics.repartitioned_vertices == 0);
+        REQUIRE(reuse.tree.member == promoted_member);
+        order(changed); // Promotion does not bypass periodic refresh.
+        REQUIRE(reuse.statistics.full_rebuild);
+        REQUIRE(reuse.statistics.promoted_vertices == 0);
+        // Changing the cutoff through the raw API also starts fresh history.
+        reuse.promotion_depth = 0;
+        order(changed);
+        REQUIRE(reuse.statistics.full_rebuild);
+    }
+}
+
+TEMPLATE_TEST_CASE("temporal ND repairs exclude vertices promoted out of the region", "[temporal_nd][promotion]", int32_t, int64_t) {
+    using Int = TestType;
+    Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
+    Environment verify("CHOLMOD_NESDIS_CAMD_VERIFY", "1");
+    Common common(sizeof(Int) == 4 ? CHOLMOD_INT : CHOLMOD_LONG);
+    TemporalReuseState<Int> reuse;
+    reuse.temporal_reuse_period = 8;
+    reuse.promotion_depth = 1;
+    auto edges = test_temporal_edges<Int>();
+    Graph<Int> initial(30, edges);
+    std::vector<Int> parent(30), member(30), perm(30);
+    REQUIRE(nested_dissection_from_graph<Int>(initial.view, perm.data(), parent.data(), member.data(), &common.value, &reuse) > 0);
+    reuse.tree = test_temporal_tree<Int>();
+    edges.emplace_back(0, 14); // Moves vertex 0 out of subtree 2, into the root.
+    edges.emplace_back(1, 2);  // Still requires subtree 2 to be rebuilt.
+    Graph<Int> changed(30, edges);
+    auto nc = nested_dissection_from_graph<Int>(changed.view, perm.data(), parent.data(), member.data(), &common.value, &reuse);
+    check_separator_forest(changed, Int(nc), parent, member, perm);
+    REQUIRE_FALSE(reuse.statistics.full_rebuild);
+    REQUIRE(reuse.statistics.promoted_vertices == 1);
+    REQUIRE(reuse.statistics.recomputed_subtrees == 1);
+    REQUIRE(reuse.statistics.repartitioned_vertices == 5); // Previously six.
+    REQUIRE(reuse.tree.member[0] == 14);
+}
+
+TEMPLATE_TEST_CASE("temporal ND promotion rebuilds only affected vertex lists", "[temporal_nd][promotion]", int32_t, int64_t) {
+    using Int = TestType;
+    const Int parent[]{2, 2, 4, 4, -1}, member[]{0, 0, 1, 1, 2, 2, 3, 3, 4, 4};
+    auto tree = PersistentSeparatorTree<Int>::from_cholmod(10, 5, parent, member);
+    const bool spare_capacity = GENERATE(false, true);
+    if (spare_capacity) tree.nodes[4].separator_vertices.reserve(4);
+    std::vector<const Int*> storage;
+    for (const auto& node : tree.nodes) storage.push_back(node.separator_vertices.data());
+    Graph<Int> graph(10, {{0, 2}, {4, 6}});
+    REQUIRE(tree.promote_violations(graph.p.data(), graph.i.data(), -1) == 2);
+    // Node 2 gains vertex 0 and loses vertex 4: its size stays the same.
+    const std::vector<std::vector<Int>> expected{{1}, {2, 3}, {0, 5}, {6, 7}, {4, 8, 9}};
+    for (size_t c = 0; c < tree.nodes.size(); ++c) {
+        REQUIRE(tree.nodes[c].separator_vertices == expected[c]);
+        for (Int v : expected[c]) REQUIRE(tree.member[v] == Int(c));
+        // Unchanged lists and affected lists with sufficient capacity retain storage.
+        if (c != 4 || spare_capacity) REQUIRE(tree.nodes[c].separator_vertices.data() == storage[c]);
+    }
+    REQUIRE(tree.promote_violations(graph.p.data(), graph.i.data(), -1) == 0);
+    for (size_t c = 0; c < tree.nodes.size(); ++c)
+        REQUIRE(tree.nodes[c].separator_vertices == expected[c]);
+}
+
+TEMPLATE_TEST_CASE("temporal ND promotion leaves unsupported moves to rebuilding", "[temporal_nd][promotion]", int32_t, int64_t) {
+    using Int = TestType;
+    PersistentSeparatorTree<Int> tree;
+    std::vector<std::pair<Int, Int>> edges;
+    SECTION("would empty an existing node") {
+        const Int parent[]{2, 2, -1}, member[]{0, 1, 2};
+        tree = PersistentSeparatorTree<Int>::from_cholmod(3, 3, parent, member);
+        edges = {{0, 1}};
+    }
+    SECTION("would join forest roots") {
+        const Int parent[]{-1, -1}, member[]{0, 0, 1, 1};
+        tree = PersistentSeparatorTree<Int>::from_cholmod(4, 2, parent, member);
+        edges = {{0, 2}};
+    }
+    const auto before = tree;
+    Graph<Int> graph(tree.member.size(), edges);
+    REQUIRE(tree.promote_violations(graph.p.data(), graph.i.data(), -1) == 0);
+    REQUIRE(tree.member == before.member);
+    REQUIRE(tree.roots == before.roots);
+    for (size_t c = 0; c < tree.nodes.size(); ++c)
+        REQUIRE(tree.nodes[c].separator_vertices == before.nodes[c].separator_vertices);
+    REQUIRE(tree.dirty_subtrees(graph.p.data(), graph.i.data()).full_rebuild);
+}
+
 TEMPLATE_TEST_CASE("temporal ND rebuild period and cache lifetime", "[temporal_nd]", int32_t, int64_t) {
     using Int = TestType;
     Environment scotch("CHOLMOD_NESDIS_SCOTCH_LEVELS", "0");
